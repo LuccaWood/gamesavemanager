@@ -352,12 +352,8 @@ class SteamGridDB:
             if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
                 raise ArtworkError("SteamGridDB 返回的数据格式不正确。")
             return data
-        except requests.Timeout:
-            raise ArtworkError("连接 SteamGridDB 超时，请检查网络后重试。") from None
-        except requests.exceptions.ProxyError:
-            raise ArtworkError("无法连接代理，请检查地址和代理服务。") from None
-        except requests.RequestException:
-            raise ArtworkError("无法连接 SteamGridDB，请检查网络后重试。") from None
+        except requests.RequestException as error:
+            raise self._request_error(error) from None
         finally:
             if response is not None:
                 response.close()
@@ -393,15 +389,37 @@ class SteamGridDB:
             filename = f"{kind}.{ {'PNG': 'png', 'JPEG': 'jpg', 'WEBP': 'webp'}[image_format]}"
             temporary.rename(staging / filename)
             return filename, width, height
-        except requests.Timeout:
-            raise ArtworkError("图片下载超时，请检查网络后重试。") from None
-        except requests.exceptions.ProxyError:
-            raise ArtworkError("无法连接代理，请检查地址和代理服务。") from None
-        except requests.RequestException:
-            raise ArtworkError("图片下载失败，请检查网络后重试。") from None
+        except requests.RequestException as error:
+            raise self._request_error(error, download=True) from None
         finally:
             if response is not None:
                 response.close()
+
+    @staticmethod
+    def _request_error(error: requests.RequestException, download=False) -> ArtworkError:
+        details = str(error)
+        stage = "图片下载" if download else "SteamGridDB 请求"
+        if "CERTIFICATE_VERIFY_FAILED" in details or "certificate verify failed" in details.casefold():
+            message = "HTTPS 证书验证失败，请检查系统时间及代理或服务器的证书信任。"
+        elif isinstance(error, requests.exceptions.SSLError):
+            message = "TLS 握手失败，请检查代理协议及 HTTPS 连接。"
+        elif isinstance(error, requests.exceptions.InvalidSchema):
+            message = ("当前运行环境缺少 SOCKS 支持，请安装 requests[socks] 后重新构建 EXE 或运行。"
+                       if "Missing dependencies for SOCKS support" in details
+                       else "联网组件不支持当前代理协议，请检查运行环境和代理协议。")
+        elif any(marker in details for marker in ("SOCKS5 proxy server sent invalid data", "SOCKS4 proxy server sent invalid data")):
+            message = ("SOCKS 代理握手失败，代理端口未返回有效的 SOCKS 响应。"
+                       "如果该端口提供 HTTP 代理，请填写 http://；socket:// 要求 SOCKS5 服务。")
+        elif any(marker in details for marker in ("SOCKS5 authentication failed", "No username/password supplied",
+                                                  "All offered SOCKS5 authentication methods were rejected", "407 Proxy Authentication Required")):
+            message = "代理认证失败，请检查代理认证信息。"
+        elif isinstance(error, requests.Timeout):
+            message = "连接超时，请检查代理连接或目标网站访问后重试。"
+        elif isinstance(error, requests.exceptions.ProxyError):
+            message = "无法连接代理，请检查代理服务及当前端口支持的协议。"
+        else:
+            message = "图片下载失败，请检查网络后重试。" if download else "无法连接 SteamGridDB，请检查网络后重试。"
+        return ArtworkError(f"{stage}：{message}")
 
     def _validate_image_url(self, url: str) -> str:
         try:

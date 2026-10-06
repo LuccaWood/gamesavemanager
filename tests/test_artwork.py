@@ -1,6 +1,8 @@
 import io
 import json
+import socketserver
 import tempfile
+import threading
 import traceback
 import unittest
 from pathlib import Path
@@ -323,6 +325,60 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
                     self.assertNotIn(value, str(error))
                 else:
                     self.fail("无效代理地址未被拒绝")
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_proxy_tls_and_dependency_errors_explain_failure_without_secrets(self, get):
+        client = SteamGridDB("private-test-key", proxy_url="socks5h://ProxyUsernameSecret:Secret@localhost:7890")
+        cases = (
+            (requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED"), "证书验证失败"),
+            (requests.exceptions.SSLError("WRONG_VERSION_NUMBER"), "TLS 握手失败"),
+            (requests.exceptions.InvalidSchema("Missing dependencies for SOCKS support."), "缺少 SOCKS"),
+            (requests.ConnectionError("SOCKS5 proxy server sent invalid data"), "SOCKS 代理握手失败"),
+            (requests.ConnectionError("SOCKS5 authentication failed"), "代理认证失败"),
+        )
+        try:
+            for failure, expected in cases:
+                failure.args = (*failure.args, "private-test-key http://ProxyUsernameSecret:Secret@localhost:7890")
+                for action in ("api", "image"):
+                    with self.subTest(failure=type(failure).__name__, expected=expected, action=action):
+                        get.side_effect = failure
+                        with self.assertRaisesRegex(ArtworkError, expected) as raised:
+                            if action == "api":
+                                client.search("Game")
+                            else:
+                                with tempfile.TemporaryDirectory() as directory:
+                                    client._download("https://cdn2.steamgriddb.com/grid/1.png", Path(directory), "cover", (600, 900))
+                        details = "".join(traceback.format_exception(raised.exception))
+                        for secret in ("private-test-key", "ProxyUsernameSecret", "Secret"):
+                            self.assertNotIn(secret, details)
+                        self.assertTrue(client._session.verify)
+        finally:
+            client.close()
+
+    def test_socket_proxy_to_http_only_port_reports_socks_handshake_failure(self):
+        received = []
+
+        class HTTPOnlyProxy(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                with self.request.makefile("rb") as greeting:
+                    received.append(greeting.read(3))
+                self.request.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+
+        with socketserver.TCPServer(("127.0.0.1", 0), HTTPOnlyProxy) as proxy:
+            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            thread.start()
+            client = SteamGridDB("private-test-key", f"socket://127.0.0.1:{proxy.server_address[1]}")
+            try:
+                with self.assertRaisesRegex(ArtworkError, "SOCKS 代理握手失败") as raised:
+                    client.search("Game")
+                self.assertIn("http://", str(raised.exception))
+                self.assertEqual(received, [b"\x05\x01\x00"])
+                self.assertEqual(client._session.proxies["https"].split("://", 1)[0], "socks5h")
+            finally:
+                client.close()
+                proxy.shutdown()
+                thread.join(timeout=2)
 
     @patch("game_manager.artwork.requests.Session.get")
     def test_proxy_request_errors_hide_key_and_password(self, get):
