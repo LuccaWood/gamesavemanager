@@ -144,7 +144,7 @@ class UITests(unittest.TestCase):
         self.wait_for_task()
         self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
         self.assertFalse((self.save_dir / "extra.dat").exists())
-        self.assertEqual(len(self.app.backup_table.get_children()), 3)
+        self.assertEqual(len(self.app.backup_table.get_children()), 2)
         self.app.tabs.set("数据打包")
         self.app.export_game()
         self.wait_for_task()
@@ -153,11 +153,72 @@ class UITests(unittest.TestCase):
         self.assertTrue(export.is_file())
         with zipfile.ZipFile(export) as archive:
             self.assertIn("game.json", archive.namelist())
-            self.assertEqual(sum(name.endswith("save.zip") for name in archive.namelist()), 3)
+            self.assertEqual(sum(name.endswith("save.zip") for name in archive.namelist()), 2)
         self.app.backup_table.selection_set(original_id)
         self.app.delete_backup()
         self.wait_for_task()
-        self.assertEqual(len(self.app.backup_table.get_children()), 2)
+        self.assertEqual(len(self.app.backup_table.get_children()), 1)
+
+    def test_delete_multiple_selected_backups_with_one_confirmation(self):
+        from game_manager.ui import messagebox
+        records = [self.app.backups.create(self.game) for _ in range(3)]
+        self.app.refresh()
+        self.assertEqual(str(self.app.backup_table.cget("selectmode")), "extended")
+        self.app.backup_table.selection_set([records[0]["id"], records[2]["id"]])
+        self.app.delete_backup()
+        self.wait_for_task()
+        messagebox.askyesno.assert_called_once()
+        self.assertIn("2 条", messagebox.askyesno.call_args.args[1])
+        self.assertEqual(self.app.backup_table.get_children(), (records[1]["id"],))
+        self.assertEqual([entry["id"] for entry in self.app.backups.list_backups(self.game)], [records[1]["id"]])
+        self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
+
+    def test_cancel_multiple_backup_deletion_preserves_all_records(self):
+        records = [self.app.backups.create(self.game) for _ in range(2)]
+        self.app.refresh()
+        self.app.backup_table.selection_set([entry["id"] for entry in records])
+        with patch("game_manager.ui.messagebox.askyesno", return_value=False):
+            self.app.delete_backup()
+        self.assertFalse(self.app.busy)
+        self.assertEqual({entry["id"] for entry in self.app.backups.list_backups(self.game)}, {entry["id"] for entry in records})
+
+    def test_restore_copy_and_open_require_one_selected_backup(self):
+        from game_manager.ui import messagebox
+        records = [self.app.backups.create(self.game) for _ in range(2)]
+        self.app.refresh()
+        self.app.backup_table.selection_set([entry["id"] for entry in records])
+        with patch.object(self.app, "run_task") as run, patch("game_manager.ui.open_folder") as open_folder:
+            self.app.restore_backup()
+            self.app.copy_backup()
+            self.app.open_backup()
+        run.assert_not_called()
+        open_folder.assert_not_called()
+        messagebox.askyesno.assert_not_called()
+        self.assertEqual(messagebox.showinfo.call_count, 3)
+
+    def test_partial_multiple_deletion_failure_refreshes_remaining_records(self):
+        import shutil
+        from game_manager.ui import messagebox
+        records = [self.app.backups.create(self.game) for _ in range(4)]
+        self.app.refresh()
+        self.app.backup_table.selection_set([records[index]["id"] for index in (0, 2, 3)])
+        selected = self.app.backup_table.selection()
+        failed = self.app.backups.backup_dir(self.game, selected[1])
+        original_rmtree = shutil.rmtree
+
+        def remove(path, *args, **kwargs):
+            if Path(path) == failed:
+                raise PermissionError("simulated locked backup")
+            return original_rmtree(path, *args, **kwargs)
+
+        with patch("game_manager.backups.shutil.rmtree", side_effect=remove):
+            self.app.delete_backup()
+            self.wait_for_task()
+        expected = {entry["id"] for entry in records} - {selected[0]}
+        self.assertEqual(set(self.app.backup_table.get_children()), expected)
+        self.assertEqual({entry["id"] for entry in self.app.backups.list_backups(self.game)}, expected)
+        self.assertIn("已删除 1 / 共 3", messagebox.showerror.call_args.args[1])
+        self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
 
     def test_busy_disables_switching_and_controls(self):
         second = self.app.storage.save_game({"english_name": "Second Game"})
@@ -305,7 +366,7 @@ class UITests(unittest.TestCase):
             self.wait_for_artwork()
             self.wait_for_task()
         self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
-        self.assertEqual(len(self.app.backups.list_backups(game)), 2)
+        self.assertEqual(len(self.app.backups.list_backups(game)), 1)
         self.assertIn(game["english_name"], messagebox.askyesno.call_args.args[1])
         self.assertEqual(self.app.selected_id, second["id"])
 

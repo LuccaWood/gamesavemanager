@@ -212,7 +212,23 @@ class BackupManager:
                 raise ValueError("备份记录不存在")
             shutil.rmtree(directory)
 
-    def restore(self, game: dict, backup_id: str) -> dict | None:
+    def delete_many(self, game: dict, backup_ids: list[str]) -> int:
+        with self._lock:
+            directories = [self.backup_dir(game, backup_id) for backup_id in dict.fromkeys(backup_ids)]
+            for directory in directories:
+                if not directory.is_dir():
+                    raise ValueError(f"备份记录不存在：{directory.name}")
+            deleted = 0
+            for directory in directories:
+                try:
+                    shutil.rmtree(directory)
+                except OSError as error:
+                    raise RuntimeError(f"删除备份失败：已删除 {deleted} / 共 {len(directories)} 条；"
+                                       f"当前失败记录：{directory.name}。{error}") from error
+                deleted += 1
+            return deleted
+
+    def restore(self, game: dict, backup_id: str) -> str | None:
         with self._lock:
             destination = self._save_path(game)
             archive_path = self.backup_dir(game, backup_id) / "save.zip"
@@ -234,7 +250,6 @@ class BackupManager:
                             output.parent.mkdir(parents=True, exist_ok=True)
                             with archive.open(member) as source, output.open("xb") as target:
                                 shutil.copyfileobj(source, target)
-                safety = self.create(game, reason="before_restore") if destination.exists() else None
                 if destination.exists():
                     destination.rename(previous)
                     moved = True
@@ -247,13 +262,13 @@ class BackupManager:
                         except OSError as rollback_error:
                             raise RuntimeError(f"还原失败，原存档保留在 {previous}，请手动恢复。") from rollback_error
                     raise error
+                warning = None
                 if moved:
                     try:
                         shutil.rmtree(previous)
                     except OSError:
-                        if safety is not None:
-                            safety["cleanup_warning"] = f"还原成功，但旧目录未能清理：{previous}"
-                return safety
+                        warning = f"还原成功，但旧目录未能清理：{previous}"
+                return warning
             finally:
                 if temporary.exists():
                     shutil.rmtree(temporary, ignore_errors=True)

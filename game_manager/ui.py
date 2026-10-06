@@ -495,7 +495,7 @@ class GameManagerApp(ctk.CTk):
         self.button(bar, "＋ 立即备份", self.create_backup, width=130).pack(side="left")
         self.button(bar, "打开备份目录", lambda: self.open_game_data(game, "backups"),
                     width=130, fg_color="#303b51").pack(side="left", padx=10)
-        ctk.CTkLabel(bar, text="还原会先备份当前存档，再完整替换目录。", text_color=MUTED).pack(side="right")
+        ctk.CTkLabel(bar, text="还原将直接替换存档目录。", text_color=MUTED).pack(side="right")
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Saves.Treeview", background=PANEL, fieldbackground=PANEL,
@@ -507,7 +507,7 @@ class GameManagerApp(ctk.CTk):
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
         self.backup_table = ttk.Treeview(table_frame, columns=("sequence", "time", "reason", "size"),
-                                         show="headings", selectmode="browse", style="Saves.Treeview")
+                                         show="headings", selectmode="extended", style="Saves.Treeview")
         for key, text, width in (("sequence", "编号", 65), ("time", "本地备份时间", 210),
                                  ("reason", "类型", 110), ("size", "压缩大小", 95)):
             self.backup_table.heading(key, text=text)
@@ -532,8 +532,10 @@ class GameManagerApp(ctk.CTk):
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.grid(row=2, column=0, padx=12, pady=14, sticky="ew")
         for text, callback in (("还原所选", self.restore_backup), ("复制备份", self.copy_backup),
-                               ("打开所选目录", self.open_backup), ("删除备份", self.delete_backup)):
+                               ("打开所选目录", self.open_backup), ("删除所选", self.delete_backup)):
             self.button(actions, text, callback, width=118, fg_color="#303b51").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(parent, text="按住 Ctrl（macOS 为 ⌘）点选多条，或用 Shift 连选，再点击删除所选。",
+                     text_color=MUTED, anchor="w").grid(row=4, column=0, padx=12, pady=(0, 8), sticky="w")
 
     def render_artwork(self, parent, game):
         parent.grid_columnconfigure(0, weight=1)
@@ -659,6 +661,9 @@ class GameManagerApp(ctk.CTk):
         if not selection:
             messagebox.showinfo("选择备份", "请先在列表中选择一条备份。", parent=self)
             return None
+        if len(selection) != 1:
+            messagebox.showinfo("选择备份", "此操作需要只选择一条备份；多选可用于删除。", parent=self)
+            return None
         return selection[0]
 
     def create_backup(self):
@@ -690,19 +695,20 @@ class GameManagerApp(ctk.CTk):
         self.confirm_restore(game, backup_id)
 
     def confirm_restore(self, game, backup_id):
-        if messagebox.askyesno("还原存档", "请先关闭游戏。\n还原会先备份当前存档，然后完整替换以下目录：\n"
+        if messagebox.askyesno("还原存档", "请先关闭游戏。\n还原将直接替换以下目录：\n"
                               + game["english_name"] + "\n" + game["save_path"] + "\n是否继续？", parent=self):
             self.run_task("正在校验并还原存档…", lambda: self.backups.restore(game, backup_id),
-                          lambda result: self.operation_done("还原完成。" + (
-                              f"原存档已保护为 #{result['sequence']:06d}。" if result else "")
-                              + (result.get("cleanup_warning", "") if result else "")))
+                          lambda warning: self.operation_done("还原完成。" + (warning or "")))
 
     def delete_backup(self):
-        backup_id = self.backup_selection()
-        if backup_id and messagebox.askyesno("删除备份", "永久删除这条备份？当前游戏存档不受影响。", parent=self):
+        backup_ids = list(self.backup_table.selection())
+        if not backup_ids:
+            messagebox.showinfo("选择备份", "请先选择要删除的一条或多条备份。", parent=self)
+            return
+        if messagebox.askyesno("删除备份", f"永久删除所选的 {len(backup_ids)} 条备份？当前游戏存档不受影响。", parent=self):
             game = dict(self.selected_game())
-            self.run_task("正在删除备份…", lambda: self.backups.delete(game, backup_id),
-                          lambda _: self.operation_done("备份已删除。"))
+            self.run_task("正在删除所选备份…", lambda: self.backups.delete_many(game, backup_ids),
+                          lambda count: self.operation_done(f"已删除 {count} 条备份。"))
 
     def open_backup(self):
         backup_id = self.backup_selection()

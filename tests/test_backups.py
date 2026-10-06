@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ntpath
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -64,7 +65,7 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), {"old": True})
         self.assertEqual(list(self.root.glob(".state.json.*.tmp")), [])
 
-    def test_backup_restore_completely_replaces_directory_and_saves_current(self):
+    def test_backup_restore_completely_replaces_directory_without_new_backup(self):
         self.write("nested/中文.sav", "old")
         (self.save / "empty").mkdir()
         backup = self.manager.create(self.game)
@@ -73,13 +74,17 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(timestamp.microsecond, 0)
         self.write("nested/中文.sav", "new")
         self.write("extra.sav", "remove me")
-        safety = self.manager.restore(self.game, backup["id"])
+        records = self.manager.list_backups(self.game)
+        counter = self.storage.game_dir(self.game) / "sequence.json"
+        sequence = counter.read_bytes()
+        result = self.manager.restore(self.game, backup["id"])
         self.assertEqual((self.save / "nested/中文.sav").read_text(), "old")
         self.assertFalse((self.save / "extra.sav").exists())
         self.assertTrue((self.save / "empty").is_dir())
-        self.assertEqual(safety["reason"], "before_restore")
-        with zipfile.ZipFile(self.manager.backup_dir(self.game, safety["id"]) / "save.zip") as archive:
-            self.assertEqual(archive.read("extra.sav"), b"remove me")
+        self.assertIsNone(result)
+        self.assertEqual(self.manager.list_backups(self.game), records)
+        self.assertEqual(counter.read_bytes(), sequence)
+        self.assertEqual(list(self.root.glob(".gsm-*")), [])
 
     def test_empty_save_and_missing_destination_restore(self):
         backup = self.manager.create(self.game)
@@ -102,6 +107,56 @@ class BackupTests(unittest.TestCase):
         next_backup = reloaded.create(self.game)
         self.assertEqual(next_backup["sequence"], 3)
         self.assertEqual([entry["sequence"] for entry in reloaded.list_backups(self.game)], [3])
+
+    def test_delete_many_deduplicates_selection_and_keeps_other_backups(self):
+        self.write("slot.sav", "payload")
+        records = [self.manager.create(self.game) for _ in range(3)]
+        counter = self.storage.game_dir(self.game) / "sequence.json"
+        sequence = counter.read_bytes()
+        self.assertEqual(self.manager.delete_many(self.game, []), 0)
+        self.assertEqual(self.manager.delete_many(
+            self.game, [records[0]["id"], records[2]["id"], records[0]["id"]]), 2)
+        self.assertEqual(self.manager.list_backups(self.game), [records[1]])
+        self.assertEqual(counter.read_bytes(), sequence)
+        self.assertEqual((self.save / "slot.sav").read_text(), "payload")
+
+    def test_delete_many_validates_all_ids_before_deleting(self):
+        backup = self.manager.create(self.game)
+        directory = self.manager.backup_dir(self.game, backup["id"])
+        for invalid in ("../outside", "999999_20261006_010000"):
+            with self.subTest(backup_id=invalid), self.assertRaises(ValueError):
+                self.manager.delete_many(self.game, [backup["id"], invalid])
+            self.assertTrue((directory / "save.zip").is_file())
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("untouched")
+        linked_id = "999998_20261006_010000"
+        linked = self.manager.backup_dir(self.game, linked_id)
+        try:
+            linked.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("当前系统不允许创建符号链接")
+        with self.assertRaisesRegex(ValueError, "链接"):
+            self.manager.delete_many(self.game, [backup["id"], linked_id])
+        self.assertTrue((directory / "save.zip").is_file())
+        self.assertEqual((outside / "keep").read_text(), "untouched")
+
+    def test_delete_many_reports_partial_failure_and_keeps_unselected_backups(self):
+        records = [self.manager.create(self.game) for _ in range(4)]
+        original_rmtree = shutil.rmtree
+        failed = self.manager.backup_dir(self.game, records[1]["id"])
+
+        def fail_second(path, *args, **kwargs):
+            if Path(path) == failed:
+                raise PermissionError("simulated backup lock")
+            return original_rmtree(path, *args, **kwargs)
+
+        with mock.patch("game_manager.backups.shutil.rmtree", side_effect=fail_second):
+            with self.assertRaisesRegex(RuntimeError, "已删除 1 / 共 3") as caught:
+                self.manager.delete_many(self.game, [record["id"] for record in records[:3]])
+        self.assertIn(records[1]["id"], str(caught.exception))
+        self.assertEqual({record["id"] for record in self.manager.list_backups(self.game)},
+                         {record["id"] for record in records[1:]})
 
     def test_same_second_backups_have_distinct_ids(self):
         fixed = datetime.now().astimezone().replace(microsecond=0)
@@ -292,7 +347,50 @@ class BackupTests(unittest.TestCase):
                 self.manager.restore(self.game, backup["id"])
         self.assertEqual((self.save / "slot.sav").read_text(), "current")
         self.assertEqual(list(self.root.glob(".gsm-*")), [])
-        self.assertEqual(self.manager.list_backups(self.game)[0]["reason"], "before_restore")
+        self.assertEqual(self.manager.list_backups(self.game), [backup])
+
+    def test_restore_cleanup_failure_reports_preserved_old_directory(self):
+        self.write("slot.sav", "old")
+        backup = self.manager.create(self.game)
+        self.write("slot.sav", "current")
+        original_rmtree = shutil.rmtree
+
+        def fail_previous_cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith(".gsm-previous-"):
+                raise PermissionError("simulated old directory lock")
+            return original_rmtree(path, *args, **kwargs)
+
+        with mock.patch("game_manager.backups.shutil.rmtree", side_effect=fail_previous_cleanup):
+            warning = self.manager.restore(self.game, backup["id"])
+        previous = list(self.root.glob(".gsm-previous-*"))
+        self.assertEqual(len(previous), 1)
+        self.assertIsInstance(warning, str)
+        self.assertIn(str(previous[0]), warning)
+        self.assertEqual((self.save / "slot.sav").read_text(), "old")
+        self.assertEqual((previous[0] / "slot.sav").read_text(), "current")
+        self.assertEqual(self.manager.list_backups(self.game), [backup])
+
+    def test_restore_failed_rollback_reports_preserved_original_directory(self):
+        self.write("slot.sav", "old")
+        backup = self.manager.create(self.game)
+        self.write("slot.sav", "current")
+        original_rename = Path.rename
+
+        def fail_install_and_rollback(path, target):
+            if path.name.startswith((".gsm-restore-", ".gsm-previous-")):
+                raise PermissionError("simulated directory lock")
+            return original_rename(path, target)
+
+        with mock.patch.object(Path, "rename", fail_install_and_rollback):
+            with self.assertRaisesRegex(RuntimeError, "原存档保留在") as caught:
+                self.manager.restore(self.game, backup["id"])
+        previous = list(self.root.glob(".gsm-previous-*"))
+        self.assertEqual(len(previous), 1)
+        self.assertIn(str(previous[0]), str(caught.exception))
+        self.assertEqual((previous[0] / "slot.sav").read_text(), "current")
+        self.assertFalse(self.save.exists())
+        self.assertEqual(list(self.root.glob(".gsm-restore-*")), [])
+        self.assertEqual(self.manager.list_backups(self.game), [backup])
 
     def test_export_contains_backups_artwork_and_no_settings(self):
         self.write("slot.sav", "game data")
