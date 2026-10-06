@@ -918,6 +918,71 @@ class UITests(unittest.TestCase):
             self.app.refresh()
             self.assertIn("warning", self.app.artwork_manifest(self.game))
 
+    def test_backup_note_edit_persists_and_shows_in_centered_column(self):
+        backup = self.app.backups.create(self.game)
+        self.app.refresh()
+        self.assertIn("note", self.app.backup_table.cget("columns"))
+        self.assertEqual(str(self.app.backup_table.column("note", "anchor")), "center")
+        self.app.backup_table.selection_set(backup["id"])
+        self.app.edit_backup_note()
+        dialog = self.app.dialog
+        dialog.note.insert("1.0", "第一章完成\n准备挑战最终 Boss")
+        dialog.save()
+        record = self.app.backups.list_backups(self.game)[0]
+        self.assertEqual(record["note"], "第一章完成\n准备挑战最终 Boss")
+        self.assertEqual(self.app.backup_table.item(backup["id"], "values")[3], "第一章完成 准备挑战最终 Boss")
+        self.assertEqual(self.app.backup_table.selection(), (backup["id"],))
+        self.app.edit_backup_note()
+        self.assertEqual(self.app.dialog.note.get("1.0", "end-1c"), record["note"])
+        self.app.dialog.destroy()
+
+    def test_backup_note_cancel_clear_and_invalid_selection(self):
+        first = self.app.backups.create(self.game)
+        second = self.app.backups.copy(self.game, first["id"])
+        self.app.backups.update_note(self.game, first["id"], "保留备注")
+        self.app.refresh()
+        self.app.backup_table.selection_set([first["id"], second["id"]])
+        self.app.edit_backup_note()
+        self.assertIsNone(self.app.dialog)
+        self.app.backup_table.selection_set(first["id"])
+        self.app.edit_backup_note()
+        self.app.dialog.note.insert("end", "取消修改")
+        self.app.dialog.destroy()
+        self.assertEqual(next(item for item in self.app.backups.list_backups(self.game) if item["id"] == first["id"])["note"], "保留备注")
+        self.app.edit_backup_note()
+        self.app.dialog.note.delete("1.0", "end")
+        self.app.dialog.save()
+        self.assertEqual(self.app.backup_table.item(first["id"], "values")[3], "")
+
+    def test_backup_note_save_failure_keeps_editor_for_retry(self):
+        record = self.app.backups.create(self.game)
+        self.app.refresh()
+        self.app.backup_table.selection_set(record["id"])
+        self.app.edit_backup_note()
+        dialog = self.app.dialog
+        dialog.note.insert("1.0", "待保存备注")
+        with patch.object(self.app.backups, "update_note", side_effect=PermissionError("文件被占用")):
+            dialog.save()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(dialog.note.get("1.0", "end-1c"), "待保存备注")
+        self.assertIn("文件被占用", dialog.error.cget("text"))
+        self.assertEqual(self.app.backups.list_backups(self.game)[0]["note"], "")
+        dialog.save()
+        self.assertEqual(self.app.backups.list_backups(self.game)[0]["note"], "待保存备注")
+
+    def test_backup_note_double_click_edits_clicked_row(self):
+        from types import SimpleNamespace
+        first = self.app.backups.create(self.game)
+        second = self.app.backups.copy(self.game, first["id"])
+        self.app.refresh()
+        self.app.backup_table.selection_set(first["id"])
+        with patch.object(self.app.backup_table, "identify_row", return_value=second["id"]):
+            self.app.edit_backup_note(SimpleNamespace(y=50))
+        self.app.dialog.note.insert("1.0", "第二份备份")
+        self.app.dialog.save()
+        self.assertEqual(self.app.backup_table.item(second["id"], "values")[3], "第二份备份")
+        self.assertEqual(self.app.backup_table.item(first["id"], "values")[3], "")
+
     def test_game_form_and_settings_save(self):
         from game_manager.ui import SettingsDialog
         self.app.add_game()

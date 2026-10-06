@@ -134,6 +134,7 @@ class BackupManager:
                             or type(record["sequence"]) is not int or record["sequence"] < 1
                             or record["sequence"] != int(directory.name.split("_")[0])
                             or not isinstance(record["reason"], str) or type(record["size"]) is not int
+                            or not isinstance(record.get("note", ""), str)
                             or record["size"] < 0
                             or not (directory / "save.zip").is_file()):
                         raise ValueError("备份记录无效")
@@ -145,7 +146,7 @@ class BackupManager:
                 records.append(record)
             return sorted(records, key=lambda record: record["sequence"], reverse=True)
 
-    def _new_record(self, game: dict, reason: str, write_archive) -> dict:
+    def _new_record(self, game: dict, reason: str, write_archive, note: str = "") -> dict:
         root = self._root(game)
         root.mkdir(parents=True, exist_ok=True)
         counter = self.storage.game_dir(game) / "sequence.json"
@@ -169,7 +170,7 @@ class BackupManager:
             archive_path = temporary / "save.zip"
             write_archive(archive_path)
             record = {"id": backup_id, "sequence": sequence, "created_at": now.isoformat(timespec="seconds"),
-                      "reason": reason, "size": archive_path.stat().st_size}
+                      "reason": reason, "size": archive_path.stat().st_size, "note": note}
             atomic_write_json(temporary / "metadata.json", record)
             temporary.rename(destination)
             return record
@@ -199,11 +200,26 @@ class BackupManager:
             source = self.backup_dir(game, backup_id) / "save.zip"
             if not source.is_file() or _is_link(source):
                 raise ValueError("备份文件不存在或无效")
+            record = next((record for record in self.list_backups(game) if record["id"] == backup_id), None)
+            if record is None:
+                raise ValueError("备份记录不存在")
             with zipfile.ZipFile(source) as archive:
                 _validate_members(archive)
                 if archive.testzip() is not None:
                     raise ValueError("备份文件校验失败")
-            return self._new_record(game, "copy", lambda path: shutil.copyfile(source, path))
+            return self._new_record(game, "copy", lambda path: shutil.copyfile(source, path), record.get("note", ""))
+
+    def update_note(self, game: dict, backup_id: str, note: str) -> dict:
+        with self._lock:
+            if not isinstance(note, str):
+                raise ValueError("备份备注必须是文本")
+            directory = self.backup_dir(game, backup_id)
+            record = next((record for record in self.list_backups(game) if record["id"] == backup_id), None)
+            if record is None:
+                raise ValueError("备份记录不存在")
+            updated = {**record, "note": note}
+            atomic_write_json(directory / "metadata.json", updated)
+            return updated
 
     def delete(self, game: dict, backup_id: str) -> None:
         with self._lock:
@@ -409,6 +425,7 @@ class BackupManager:
                 if (record["id"] != backup_id or type(record["sequence"]) is not int or record["sequence"] < 1
                         or record["sequence"] != int(backup_id.split("_")[0])
                         or not isinstance(record["reason"], str) or type(record["size"]) is not int
+                        or not isinstance(record.get("note", ""), str)
                         or record["size"] != archive_path.stat().st_size
                         or not isinstance(record["created_at"], str)
                         or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}",

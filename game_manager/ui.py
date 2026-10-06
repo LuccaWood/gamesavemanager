@@ -220,6 +220,46 @@ class GameDialog(ctk.CTkToplevel):
         super().destroy()
 
 
+class BackupNoteDialog(ctk.CTkToplevel):
+    def __init__(self, app: GameManagerApp, game: dict, backup: dict):
+        super().__init__(app)
+        self.app, self.game, self.backup = app, game, backup
+        self.title("编辑备份备注")
+        self.geometry("620x420")
+        self.minsize(540, 360)
+        self.transient(app)
+        ctk.CTkLabel(self, text=f"#{backup['sequence']:06d} · {backup['created_at'].replace('T', ' ')}",
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=20, pady=(18, 10))
+        self.note = ctk.CTkTextbox(self, height=210, wrap="word")
+        self.note.insert("1.0", backup.get("note", ""))
+        self.note.pack(fill="both", expand=True, padx=20)
+        self.error = ctk.CTkLabel(self, text="", text_color="#ff9d9d", wraplength=560)
+        self.error.pack(anchor="w", padx=20, pady=(8, 0))
+        controls = ctk.CTkFrame(self, fg_color="transparent")
+        controls.pack(fill="x", padx=20, pady=(8, 18))
+        ctk.CTkButton(controls, text="取消", fg_color="#303b51", command=self.destroy).pack(side="left")
+        ctk.CTkButton(controls, text="保存备注", command=self.save).pack(side="right")
+        self.bind("<Escape>", lambda _: self.destroy())
+        self.after(100, self.grab_set)
+
+    def save(self):
+        if self.app.busy or self.app._closing:
+            self.error.configure(text="请等待当前操作完成后再保存备注。")
+            return
+        try:
+            game = self.app.storage.get_game(self.game["id"])
+            self.app.backups.update_note(game, self.backup["id"], self.note.get("1.0", "end-1c"))
+        except (ValueError, OSError) as exc:
+            self.error.configure(text=str(exc))
+            return
+        self.destroy()
+        self.app.operation_done("备份备注已保存。")
+        if self.app.selected_id == game["id"] and self.app.backup_table.exists(self.backup["id"]):
+            self.app.backup_table.selection_set(self.backup["id"])
+            self.app.backup_table.focus(self.backup["id"])
+            self.app.backup_table.see(self.backup["id"])
+
+
 class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, app: GameManagerApp):
         super().__init__(app)
@@ -755,16 +795,18 @@ class GameManagerApp(ctk.CTk):
         table_frame.grid(row=1, column=0, sticky="nsew", padx=12)
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
-        self.backup_table = ttk.Treeview(table_frame, columns=("sequence", "time", "size"),
+        self.backup_table = ttk.Treeview(table_frame, columns=("sequence", "time", "size", "note"),
                                          show="headings", selectmode="extended", style="Saves.Treeview")
         for key, text, width in (("sequence", "编号", 65), ("time", "本地备份时间", 210),
-                                 ("size", "压缩大小", 95)):
+                                 ("size", "压缩大小", 95), ("note", "备注", 230)):
             self.backup_table.heading(key, text=text, anchor="center")
-            self.backup_table.column(key, width=width, minwidth=60, stretch=key == "time", anchor="center")
+            self.backup_table.column(key, width=width, minwidth=100 if key == "note" else 60,
+                                     stretch=key in ("time", "note"), anchor="center")
         self.backup_table.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.backup_table.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.backup_table.configure(yscrollcommand=scrollbar.set)
+        self.backup_table.bind("<Double-1>", self.edit_backup_note)
         try:
             records = self.backups.list_backups(game)
         except (ValueError, OSError) as exc:
@@ -775,13 +817,15 @@ class GameManagerApp(ctk.CTk):
         for backup in records:
             time = backup["created_at"].replace("T", " ")
             self.backup_table.insert("", "end", iid=backup["id"], values=(
-                f"#{backup['sequence']:06d}", time, readable_size(backup["size"])))
+                f"#{backup['sequence']:06d}", time, readable_size(backup["size"]),
+                " ".join(backup.get("note", "").splitlines())))
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.grid(row=2, column=0, padx=12, pady=14, sticky="ew")
         for text, callback in (("还原所选", self.restore_backup), ("复制备份", self.copy_backup),
-                               ("打开所选目录", self.open_backup), ("删除所选", self.delete_backup)):
+                               ("打开所选目录", self.open_backup), ("删除所选", self.delete_backup),
+                               ("编辑备注", self.edit_backup_note)):
             self.button(actions, text, callback, width=118, fg_color="#303b51").pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(parent, text="按住 Ctrl（macOS 为 ⌘）点选多条，或用 Shift 连选，再点击删除所选。",
+        ctk.CTkLabel(parent, text="双击备份可编辑备注。按 Ctrl（macOS 为 ⌘）或 Shift 多选后可批量删除。",
                      text_color=MUTED, anchor="w").grid(row=4, column=0, padx=12, pady=(0, 8), sticky="w")
 
     def render_artwork(self, parent, game):
@@ -1041,6 +1085,27 @@ class GameManagerApp(ctk.CTk):
             game = dict(self.selected_game())
             self.run_task("正在复制备份…", lambda: self.backups.copy(game, backup_id),
                           lambda result: self.operation_done(f"复制完成：#{result['sequence']:06d}"))
+
+    def edit_backup_note(self, event=None):
+        if self.busy or self._closing or (self.dialog is not None and self.dialog.winfo_exists()):
+            return
+        if event is not None:
+            backup_id = self.backup_table.identify_row(event.y)
+            if not backup_id:
+                return
+            self.backup_table.selection_set(backup_id)
+        backup_id = self.backup_selection()
+        game = self.selected_game()
+        if not backup_id or game is None:
+            return
+        try:
+            record = next((item for item in self.backups.list_backups(game) if item["id"] == backup_id), None)
+            if record is None:
+                raise ValueError("备份记录已不存在，请刷新后重试。")
+        except (ValueError, OSError) as exc:
+            self.show_error(exc)
+            return
+        self.open_dialog(BackupNoteDialog, dict(game), record)
 
     def restore_backup(self):
         backup_id = self.backup_selection()

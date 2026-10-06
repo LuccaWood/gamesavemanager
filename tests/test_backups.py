@@ -108,6 +108,142 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(next_backup["sequence"], 3)
         self.assertEqual([entry["sequence"] for entry in reloaded.list_backups(self.game)], [3])
 
+    def test_update_note_persists_unicode_and_preserves_backup_contents(self):
+        self.write("slot.sav", "saved")
+        backup = self.manager.create(self.game)
+        directory = self.manager.backup_dir(self.game, backup["id"])
+        metadata = directory / "metadata.json"
+        original = json.loads(metadata.read_text(encoding="utf-8"))
+        original["import_key"] = "existing-origin"
+        atomic_write_json(metadata, original)
+        archive_bytes = (directory / "save.zip").read_bytes()
+        counter = self.storage.game_dir(self.game) / "sequence.json"
+        counter_bytes = counter.read_bytes()
+        note = "第一章通关前\n保留隐藏任务：完成 ✓"
+        result = self.manager.update_note(self.game, backup["id"], note)
+        self.assertEqual(result, {**original, "note": note})
+        self.assertEqual(json.loads(metadata.read_text(encoding="utf-8")), result)
+        loaded = BackupManager(Storage(self.storage.data_dir))
+        self.assertEqual(loaded.list_backups(self.game)[0]["note"], note)
+        self.assertEqual(loaded.update_note(self.game, backup["id"], "")["note"], "")
+        self.assertEqual((directory / "save.zip").read_bytes(), archive_bytes)
+        self.assertEqual(counter.read_bytes(), counter_bytes)
+        self.assertEqual({key: value for key, value in json.loads(metadata.read_text()).items() if key != "note"},
+                         {key: value for key, value in original.items() if key != "note"})
+
+    def test_legacy_backup_without_note_is_read_without_rewriting(self):
+        backup = self.manager.create(self.game)
+        metadata = self.manager.backup_dir(self.game, backup["id"]) / "metadata.json"
+        legacy = json.loads(metadata.read_text())
+        legacy.pop("note", None)
+        atomic_write_json(metadata, legacy)
+        original_bytes = metadata.read_bytes()
+        self.assertEqual(self.manager.list_backups(self.game)[0].get("note", ""), "")
+        self.assertEqual(metadata.read_bytes(), original_bytes)
+        self.assertEqual(self.manager.copy(self.game, backup["id"])["note"], "")
+        storage, manager = self.recipient()
+        imported = manager.import_game(self.manager.export(self.game))
+        self.assertTrue(all(record.get("note", "") == "" for record in manager.list_backups(imported["game"])))
+        self.assertEqual(metadata.read_bytes(), original_bytes)
+
+    def test_update_note_rejects_invalid_values_and_missing_backups(self):
+        backup = self.manager.create(self.game)
+        metadata = self.manager.backup_dir(self.game, backup["id"]) / "metadata.json"
+        original_bytes = metadata.read_bytes()
+        for value in (None, 1, [], {}):
+            with self.subTest(note=value), self.assertRaises(ValueError):
+                self.manager.update_note(self.game, backup["id"], value)
+            self.assertEqual(metadata.read_bytes(), original_bytes)
+        for backup_id in ("../outside", "bad-id", "999999_20260101_000000", None):
+            with self.subTest(backup_id=backup_id), self.assertRaises(ValueError):
+                self.manager.update_note(self.game, backup_id, "备注")
+            self.assertEqual(metadata.read_bytes(), original_bytes)
+
+    def test_update_note_rejects_metadata_links_and_corrupt_records(self):
+        backup = self.manager.create(self.game)
+        metadata = self.manager.backup_dir(self.game, backup["id"]) / "metadata.json"
+        outside = self.root / "outside-metadata.json"
+        metadata.rename(outside)
+        original_bytes = outside.read_bytes()
+        metadata.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            self.manager.update_note(self.game, backup["id"], "不能写入链接")
+        self.assertEqual(outside.read_bytes(), original_bytes)
+        metadata.unlink()
+        outside.rename(metadata)
+        malformed = json.loads(metadata.read_text())
+        malformed["note"] = {"invalid": True}
+        atomic_write_json(metadata, malformed)
+        with self.assertRaises(ValueError):
+            self.manager.list_backups(self.game)
+        with self.assertRaises(ValueError):
+            self.manager.update_note(self.game, backup["id"], "不能覆盖损坏记录")
+        self.assertEqual(json.loads(metadata.read_text()), malformed)
+
+    def test_update_note_atomic_failure_keeps_previous_metadata(self):
+        backup = self.manager.create(self.game)
+        directory = self.manager.backup_dir(self.game, backup["id"])
+        metadata = directory / "metadata.json"
+        original_bytes = metadata.read_bytes()
+        with mock.patch("game_manager.storage.os.replace", side_effect=OSError("disk unavailable")):
+            with self.assertRaises(OSError):
+                self.manager.update_note(self.game, backup["id"], "新备注")
+        self.assertEqual(metadata.read_bytes(), original_bytes)
+        self.assertEqual(list(directory.glob(".metadata.json.*.tmp")), [])
+
+    def test_copy_preserves_note_and_archive(self):
+        self.write("slot.sav", "saved")
+        backup = self.manager.create(self.game)
+        self.manager.update_note(self.game, backup["id"], "全成就前\n中文备注")
+        copied = self.manager.copy(self.game, backup["id"])
+        self.assertEqual(copied["note"], "全成就前\n中文备注")
+        self.assertNotEqual(copied["id"], backup["id"])
+        self.assertEqual((self.manager.backup_dir(self.game, copied["id"]) / "save.zip").read_bytes(),
+                         (self.manager.backup_dir(self.game, backup["id"]) / "save.zip").read_bytes())
+
+    def test_note_roundtrips_and_repeated_merge_keeps_local_note(self):
+        backup = self.manager.create(self.game)
+        self.manager.update_note(self.game, backup["id"], "原始备注\n第一章")
+        for kind in ("game", "library"):
+            with self.subTest(kind=kind):
+                storage = Storage(self.root / f"recipient-{kind}")
+                manager = BackupManager(storage)
+                export = (lambda: self.manager.export(self.game)) if kind == "game" else self.manager.export_library
+                import_package = manager.import_game if kind == "game" else manager.import_library
+                result = import_package(export())
+                self.assertEqual(result["imported"], 1)
+                game = storage.get_game(self.game["id"])
+                self.assertEqual(manager.list_backups(game)[0]["note"], "原始备注\n第一章")
+                manager.update_note(game, backup["id"], "目标电脑自己的备注")
+                self.manager.update_note(self.game, backup["id"], "来源电脑的新备注")
+                repeated = import_package(export())
+                self.assertEqual((repeated["imported"], repeated["skipped"]), (0, 1))
+                self.assertEqual(manager.list_backups(game)[0]["note"], "目标电脑自己的备注")
+                self.manager.update_note(self.game, backup["id"], "原始备注\n第一章")
+
+    def test_import_rejects_non_string_note_without_changing_local_backup(self):
+        backup = self.manager.create(self.game)
+        self.manager.update_note(self.game, backup["id"], "有效备注")
+        for kind in ("game", "library"):
+            with self.subTest(kind=kind):
+                storage = Storage(self.root / f"recipient-invalid-{kind}")
+                manager = BackupManager(storage)
+                package = self.manager.export(self.game) if kind == "game" else self.manager.export_library()
+                import_package = manager.import_game if kind == "game" else manager.import_library
+                import_package(package)
+                game = storage.get_game(self.game["id"])
+                local_metadata = manager.backup_dir(game, backup["id"]) / "metadata.json"
+                local_bytes = local_metadata.read_bytes()
+                prefix = "" if kind == "game" else f"games/{self.game['id']}/"
+                name = f"{prefix}backups/{backup['id']}/metadata.json"
+                with zipfile.ZipFile(package) as archive:
+                    record = json.loads(archive.read(name))
+                for note in (None, 1, [], {}):
+                    invalid = self.rewrite_package(package, {name: json.dumps({**record, "note": note}).encode()})
+                    with self.subTest(note=note), self.assertRaises(ValueError):
+                        import_package(invalid)
+                    self.assertEqual(local_metadata.read_bytes(), local_bytes)
+
     def test_delete_many_deduplicates_selection_and_keeps_other_backups(self):
         self.write("slot.sav", "payload")
         records = [self.manager.create(self.game) for _ in range(3)]
