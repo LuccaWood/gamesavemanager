@@ -38,6 +38,37 @@ def choice_artwork_worker(connection, api_key, proxy_url, action, value, destina
     connection.close()
 
 
+def save_location_worker(connection, proxy_url, english_name):
+    connection.send((True, [{"title": english_name, "label": "Windows", "path": r"%LOCALAPPDATA%\TestGame\Saved",
+                             "page_url": "https://www.pcgamingwiki.com/wiki/Test_Game", "resolved": True}]))
+    connection.close()
+
+
+def no_save_location_worker(connection, proxy_url, english_name):
+    connection.send((True, []))
+    connection.close()
+
+
+def proxy_save_location_worker(connection, proxy_url, english_name):
+    path = "%LOCALAPPDATA%\\" + ("Proxied" if proxy_url else "Direct")
+    connection.send((True, [{"title": english_name, "label": "Windows", "path": path,
+                             "page_url": "https://www.pcgamingwiki.com/wiki/Test_Game", "resolved": True}]))
+    connection.close()
+
+
+def local_save_location_worker(connection, proxy_url, english_name):
+    connection.send((True, [{"title": english_name, "label": "Windows", "path": english_name.split("|", 1)[1],
+                             "page_url": "https://www.pcgamingwiki.com/wiki/Test_Game", "resolved": True}]))
+    connection.close()
+
+
+def held_save_location_worker(connection, proxy_url, english_name):
+    connection.send((True, [{"title": english_name, "label": "Windows", "path": r"%LOCALAPPDATA%\TestGame",
+                             "page_url": "https://www.pcgamingwiki.com/wiki/Test_Game", "resolved": True}]))
+    while True:
+        time.sleep(0.02)
+
+
 @unittest.skipUnless(os.environ.get("GAME_MANAGER_GUI_TESTS") == "1", "需要可用桌面会话")
 class UITests(unittest.TestCase):
     def setUp(self):
@@ -52,7 +83,8 @@ class UITests(unittest.TestCase):
                                        "save_path": str(self.save_dir)})
         self.patches = [patch("game_manager.ui.messagebox.askyesno", return_value=True),
                         patch("game_manager.ui.messagebox.showinfo"),
-                        patch("game_manager.ui.messagebox.showerror")]
+                        patch("game_manager.ui.messagebox.showerror"),
+                        patch("game_manager.ui.pcgw_worker", no_save_location_worker)]
         for item in self.patches:
             item.start()
         self.app = GameManagerApp(self.root / "data")
@@ -172,6 +204,177 @@ class UITests(unittest.TestCase):
         self.assertEqual(self.app.api_key, "test-secret")
         saved = json.loads((self.root / "data" / "library.json").read_text())
         self.assertEqual(saved["settings"]["api_key"], "")
+
+    def test_blank_save_path_is_looked_up_and_persisted(self):
+        with patch("game_manager.ui.pcgw_worker", save_location_worker, create=True):
+            self.app.add_game()
+            dialog = self.app.dialog
+            dialog.entries["english_name"].insert(0, "Automatic Game")
+            dialog.save()
+            game_id = self.app.selected_id
+            self.wait_until(lambda: self.app.storage.get_game(game_id)["save_path"] != "")
+        self.assertEqual(self.app.storage.get_game(game_id)["save_path"], r"%LOCALAPPDATA%\TestGame\Saved")
+        self.assertEqual(Storage(self.root / "data").get_game(game_id)["save_path"], r"%LOCALAPPDATA%\TestGame\Saved")
+
+    def test_settings_are_software_wide(self):
+        from game_manager.ui import SettingsDialog
+        settings = SettingsDialog(self.app)
+        self.assertEqual(settings.title(), "软件设置")
+        self.assertEqual(self.app.settings_button.cget("text"), "软件设置")
+        self.assertEqual(settings.proxy_enabled.cget("text"), "为软件联网请求使用 HTTP 代理")
+        settings.destroy()
+
+    def test_manual_save_path_is_used_without_lookup(self):
+        with patch.object(self.app, "start_artwork_job") as start:
+            self.app.lookup_save_path(self.game, force=True)
+            self.app.create_backup()
+            self.wait_for_task()
+        start.assert_not_called()
+        self.assertEqual(len(self.app.backups.list_backups(self.game)), 1)
+
+    def test_save_lookup_discards_results_after_manual_edit_or_rename(self):
+        with patch("game_manager.ui.pcgw_worker", save_location_worker):
+            for field, value in (("save_path", str(self.save_dir)), ("english_name", "Renamed Game")):
+                game = self.app.storage.save_game({"english_name": f"Before {field}"})
+                self.app.lookup_save_path(game)
+                self.app.artwork_job["process"].join(timeout=3)
+                self.app.storage.save_game({**game, field: value, "chinese_name": "最新资料"})
+                self.wait_for_artwork()
+                stored = self.app.storage.get_game(game["id"])
+                self.assertEqual(stored[field], value)
+                self.assertEqual(stored["chinese_name"], "最新资料")
+                if field == "english_name":
+                    self.assertEqual(stored["save_path"], "")
+
+    def test_candidate_paths_require_selection_and_preserve_latest_fields(self):
+        from game_manager.ui import SaveLocationDialog
+        game = self.app.storage.save_game({"english_name": "Candidate Game"})
+        candidates = [{"label": "Steam", "path": r"<Steam-folder>\userdata\<user-id>\123",
+                       "page_url": "https://www.pcgamingwiki.com/wiki/Candidate_Game", "resolved": False},
+                      {"label": "Windows", "path": r"%LOCALAPPDATA%\CandidateGame",
+                       "page_url": "https://www.pcgamingwiki.com/wiki/Candidate_Game", "resolved": True}]
+        self.app.save_location_results(game, candidates, None)
+        self.assertIsInstance(self.app.dialog, SaveLocationDialog)
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.app.dialog.destroy()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.app.save_location_results(game, candidates, None)
+        self.app.storage.save_game({**game, "chinese_name": "修改后资料"})
+        self.app.dialog.choose(candidates[1], lambda candidate: self.app.use_save_location(game, candidate, None))
+        stored = self.app.storage.get_game(game["id"])
+        self.assertEqual(stored["save_path"], candidates[1]["path"])
+        self.assertEqual(stored["chinese_name"], "修改后资料")
+
+    def test_save_lookup_uses_global_proxy_and_needs_no_api_key(self):
+        with patch("game_manager.ui.pcgw_worker", proxy_save_location_worker):
+            for enabled, url, expected in ((False, "invalid stored proxy", "Direct"),
+                                           (True, "http://127.0.0.1:7890", "Proxied")):
+                self.app.storage.update_settings({"proxy_enabled": enabled, "proxy_url": url})
+                game = self.app.storage.save_game({"english_name": f"Proxy {enabled}"})
+                self.app.api_key = ""
+                self.app.lookup_save_path(game)
+                self.wait_for_artwork()
+                self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "%LOCALAPPDATA%\\" + expected)
+
+    def test_blank_backup_attaches_to_lookup_and_keeps_original_game(self):
+        with patch("game_manager.ui.pcgw_worker", local_save_location_worker):
+            game = self.app.storage.save_game({"english_name": "Source|" + str(self.save_dir)})
+            self.app.select(game["id"])
+            job = self.app.artwork_job
+            self.app.create_backup()
+            self.app.create_backup()
+            self.assertIs(self.app.artwork_job, job)
+            self.app.select(self.game["id"])
+            self.wait_for_artwork()
+            self.wait_for_task()
+        self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.assertEqual(len(self.app.backups.list_backups(self.game)), 0)
+        self.assertEqual(self.app.selected_id, self.game["id"])
+
+    def test_blank_restore_keeps_original_game_and_backup(self):
+        from game_manager.ui import messagebox
+        record = self.app.backups.create(self.game)
+        (self.save_dir / "slot.dat").write_text("changed", encoding="utf-8")
+        game = self.app.storage.save_game({**self.game, "english_name": "Restore|" + str(self.save_dir), "save_path": ""})
+        second = self.app.storage.save_game({"english_name": "Other Game", "save_path": str(self.root / "other")})
+        self.app.refresh()
+        self.app.backup_table.selection_set(record["id"])
+        with patch("game_manager.ui.pcgw_worker", local_save_location_worker):
+            self.app.restore_backup()
+            self.app.select(second["id"])
+            self.wait_for_artwork()
+            self.wait_for_task()
+        self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
+        self.assertEqual(len(self.app.backups.list_backups(game)), 2)
+        self.assertIn(game["english_name"], messagebox.askyesno.call_args.args[1])
+        self.assertEqual(self.app.selected_id, second["id"])
+
+    def test_lookup_queue_runs_after_images_and_can_be_cancelled_then_retried(self):
+        with patch("game_manager.ui.artwork_worker", held_artwork_worker), patch("game_manager.ui.pcgw_worker", save_location_worker):
+            job = self.start_held_download()
+            first = self.app.storage.save_game({"english_name": "Queued Game"})
+            self.app.lookup_save_path(first)
+            self.assertEqual(len(self.app.save_lookup_queue), 1)
+            self.assertIs(self.app.artwork_job, job)
+            (job["temporary"] / "release").touch()
+            self.wait_until(lambda: self.app.storage.get_game(first["id"])["save_path"] != "")
+            job = self.start_held_download()
+            second = self.app.storage.save_game({"english_name": "Cancelled Game"})
+            self.app.lookup_save_path(second)
+            self.app.stop_artwork()
+            self.wait_for_artwork()
+            self.assertEqual(self.app.save_lookup_queue, [])
+            self.assertEqual(self.app.storage.get_game(second["id"])["save_path"], "")
+            self.app.lookup_save_path(second, force=True)
+            self.wait_for_artwork()
+            self.assertNotEqual(self.app.storage.get_game(second["id"])["save_path"], "")
+
+    def test_stop_and_close_terminate_save_lookup_without_filling_path(self):
+        with patch("game_manager.ui.pcgw_worker", held_save_location_worker):
+            game = self.app.storage.save_game({"english_name": "Stopped Lookup"})
+            self.app.lookup_save_path(game)
+            job = self.app.artwork_job
+            self.wait_until(lambda: "result" in job)
+            self.assertEqual(self.app.stop_artwork_button.cget("text"), "停止查询")
+            self.app.stop_artwork()
+            self.wait_for_artwork()
+            self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+            self.assertFalse(job["temporary"].exists())
+            self.app.lookup_save_path(game, force=True)
+            process = self.app.artwork_job["process"]
+            with patch.object(self.app, "destroy") as destroy:
+                self.app.close()
+                self.wait_until(lambda: self.app.artwork_job is None)
+                destroy.assert_called_once()
+            self.assertTrue(process._closed)
+            self.assertEqual(Storage(self.root / "data").get_game(game["id"])["save_path"], "")
+
+    def test_candidate_write_failure_is_reported_without_changing_path(self):
+        from game_manager.ui import messagebox
+        game = self.app.storage.save_game({"english_name": "Write Failure"})
+        candidate = {"label": "Windows", "path": r"%LOCALAPPDATA%\WriteFailure", "resolved": True,
+                     "page_url": "https://www.pcgamingwiki.com/wiki/Write_Failure"}
+        self.app.save_location_results(game, [candidate, {**candidate, "label": "Steam"}], None)
+        with patch.object(self.app.storage, "save_game", side_effect=OSError("disk full")):
+            self.app.dialog.choose(candidate, lambda item: self.app.use_save_location(game, item, None))
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.assertIn("disk full", messagebox.showerror.call_args.args[1])
+
+    def test_close_during_data_operation_cancels_lookup_and_queue(self):
+        with patch("game_manager.ui.pcgw_worker", held_save_location_worker):
+            game = self.app.storage.save_game({"english_name": "Closing Lookup"})
+            self.app.lookup_save_path(game)
+            job = self.app.artwork_job
+            self.app.run_task("数据操作", lambda: time.sleep(0.15), lambda _: None)
+            pending = self.app.storage.save_game({"english_name": "Pending Lookup"})
+            self.app.lookup_save_path(pending)
+            self.app.close()
+            self.assertEqual(self.app.save_lookup_queue, [])
+            self.assertTrue(job["cancelled"])
+            self.wait_for_task()
+            self.wait_for_artwork()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.assertEqual(self.app.storage.get_game(pending["id"])["save_path"], "")
 
     def test_four_artwork_previews_render(self):
         from PIL import Image

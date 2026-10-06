@@ -394,5 +394,59 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
             connection.close.assert_called_once()
 
 
+class SharedNetworkSettingsTests(unittest.TestCase):
+    def test_unchecked_global_proxy_ignores_saved_invalid_address_and_environment(self):
+        from game_manager import network
+
+        environment = {"HTTP_PROXY": "http://environment.invalid:11", "HTTPS_PROXY": "http://environment.invalid:12",
+                       "ALL_PROXY": "http://environment.invalid:13", "NO_PROXY": "*"}
+        for settings in ({}, {"proxy_enabled": False, "proxy_url": "not a valid proxy"},
+                         {"proxy_enabled": False, "proxy_url": {"invalid": True}},
+                         {"proxy_enabled": "true", "proxy_url": "http://localhost:7890"}):
+            with self.subTest(settings=settings):
+                self.assertEqual(network.settings_proxy_url(settings), "")
+                with network.create_session(network.settings_proxy_url(settings)) as session:
+                    adapter = CaptureAdapter()
+                    session.mount("https://", adapter)
+                    with patch.dict("os.environ", environment), \
+                            patch("requests.sessions.get_environ_proxies", side_effect=AssertionError("读取了环境/系统代理")):
+                        session.get(SteamGridDB.BASE_URL + "/search/autocomplete/Game", allow_redirects=False).close()
+                        session.get("https://cdn2.steamgriddb.com/grid/1.png", allow_redirects=False).close()
+                    self.assertEqual(len(adapter.calls), 2)
+                    self.assertTrue(all(options["proxies"] == {} for _, options in adapter.calls))
+
+    def test_checked_global_proxy_applies_to_api_and_cdn(self):
+        from game_manager import network
+
+        settings = {"proxy_enabled": True, "proxy_url": " HTTP://localhost:7890 "}
+        proxy_url = network.settings_proxy_url(settings)
+        self.assertEqual(proxy_url, "http://localhost:7890")
+        client = SteamGridDB("private-test-key", proxy_url)
+        adapter = CaptureAdapter()
+        client._session.mount("https://", adapter)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                client.search("Game")
+                client._download("https://cdn2.steamgriddb.com/grid/1.png", Path(directory), "cover", (600, 900))
+            self.assertEqual(len(adapter.calls), 2)
+            self.assertTrue(all(options["proxies"] == {"http": proxy_url, "https": proxy_url}
+                                for _, options in adapter.calls))
+            self.assertNotIn("Authorization", adapter.calls[1][0].headers)
+        finally:
+            client.close()
+
+    def test_checked_global_proxy_requires_valid_nonempty_url_and_preserves_artwork_error(self):
+        from game_manager import network
+
+        for value in ("", None, "https://PrivateUser:PrivatePassword@localhost:7890"):
+            with self.subTest(value=value), self.assertRaises(network.NetworkError) as raised:
+                network.settings_proxy_url({"proxy_enabled": True, "proxy_url": value})
+            self.assertNotIn("PrivatePassword", str(raised.exception))
+        with self.assertRaises(ArtworkError) as raised:
+            SteamGridDB.validate_proxy_url("https://PrivateUser:PrivatePassword@localhost:7890")
+        self.assertIsInstance(raised.exception, network.NetworkError)
+        self.assertNotIn("PrivatePassword", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

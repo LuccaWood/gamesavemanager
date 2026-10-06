@@ -13,8 +13,10 @@ from urllib.parse import quote, urlsplit
 import requests
 from PIL import Image
 
+from .network import NetworkError, create_session, validate_proxy_url
 
-class ArtworkError(RuntimeError):
+
+class ArtworkError(NetworkError):
     """可直接展示给用户的图片获取错误。"""
 
 
@@ -27,29 +29,14 @@ class SteamGridDB:
 
     def __init__(self, api_key: str, proxy_url: str = ""):
         self._api_key = api_key.strip()
-        proxy_url = self.validate_proxy_url(proxy_url)
-        self._session = requests.Session()
-        self._session.trust_env = False
-        self._session.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+        self._session = create_session(self.validate_proxy_url(proxy_url))
 
     @staticmethod
     def validate_proxy_url(value: str) -> str:
         try:
-            if not isinstance(value, str):
-                raise ValueError("代理地址必须是文本")
-            value = value.strip()
-            if not value:
-                return ""
-            if any(character.isspace() or ord(character) < 32 for character in value):
-                raise ValueError("代理地址包含空白")
-            parsed = urlsplit(value)
-            if (parsed.scheme != "http" or not parsed.hostname or parsed.port is None
-                    or not 1 <= parsed.port <= 65535 or parsed.path or parsed.query or parsed.fragment
-                    or parsed.netloc.count("@") > 1 or (parsed.password is not None and not parsed.username)):
-                raise ValueError("代理地址结构无效")
-            return f"http://{parsed.netloc}"
-        except (TypeError, ValueError):
-            raise ArtworkError("HTTP 代理地址无效，请使用 http://主机:端口 格式。") from None
+            return validate_proxy_url(value)
+        except NetworkError as error:
+            raise ArtworkError(str(error)) from None
 
     def close(self) -> None:
         self._session.close()
