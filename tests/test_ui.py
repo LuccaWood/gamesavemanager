@@ -1036,12 +1036,12 @@ class UITests(unittest.TestCase):
     @patch("game_manager.ui.steam_name_worker", steam_name_worker)
     @patch("game_manager.ui.pcgw_worker", save_location_worker)
     def test_steam_query_uses_proxy_snapshot_then_pcgamingwiki_uses_resolved_name(self):
-        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "http://127.0.0.1:7890"})
         self.app.add_game()
         dialog = self.app.dialog
         dialog.entries["english_name"].insert(0, "570")
         dialog.save()
-        self.assertEqual(dialog.steam_job["proxy_url"], "socks5h://127.0.0.1:7890")
+        self.assertEqual(dialog.steam_job["proxy_url"], "http://127.0.0.1:7890")
         self.app.storage.update_settings({"proxy_enabled": False})
         self.wait_until(lambda: not dialog.winfo_exists())
         self.assertEqual(self.app.artwork_job["value"], "Dota 2")
@@ -1151,7 +1151,7 @@ class UITests(unittest.TestCase):
         from customtkinter import CTkButton
         from game_manager.ui import GameChoiceDialog, SaveLocationDialog
         with patch("game_manager.ui.pcgw_worker", choice_steam_cloud_worker):
-            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "http://127.0.0.1:7890"})
             game = self.app.storage.save_game({"english_name": "Steam Selected|" + str(self.save_dir)})
             self.app.select(game["id"])
             self.app.create_backup()
@@ -1162,7 +1162,7 @@ class UITests(unittest.TestCase):
             self.app.storage.update_settings({"proxy_enabled": False})
             self.choose_pcgw_article(202)
             self.assertEqual(self.app.artwork_job["value"]["id"], 202)
-            self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "socks5h://127.0.0.1:7890")
+            self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "http://127.0.0.1:7890")
             self.wait_for_artwork()
             self.assertIsInstance(self.app.dialog, SaveLocationDialog)
             self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
@@ -1233,7 +1233,7 @@ class UITests(unittest.TestCase):
 
     def test_pcgw_article_choice_preserves_proxy_and_original_backup_callback(self):
         with patch("game_manager.ui.pcgw_worker", choice_save_game_worker):
-            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "http://127.0.0.1:7890"})
             game = self.app.storage.save_game({"english_name": "Selected|" + str(self.save_dir)})
             self.app.select(game["id"])
             self.app.create_backup()
@@ -1242,7 +1242,7 @@ class UITests(unittest.TestCase):
             self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "http://localhost:8080"})
             self.choose_pcgw_article(202)
             self.assertEqual(self.app.artwork_job["value"]["pageid"], 202)
-            self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "socks5h://127.0.0.1:7890")
+            self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "http://127.0.0.1:7890")
             self.wait_for_artwork()
             self.wait_for_task()
         self.assertEqual(len(self.app.backups.list_backups(game)), 1)
@@ -1316,11 +1316,10 @@ class UITests(unittest.TestCase):
             self.wait_for_artwork()
         self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
 
-    def test_proxy_settings_accept_https_and_socket_alias(self):
+    def test_proxy_settings_accept_http_and_https(self):
         from game_manager.ui import SettingsDialog
         for proxy_url, expected in (("https://localhost:7890", "https://localhost:7890"),
-                                    ("socket://127.0.0.1:7890", "socks5h://127.0.0.1:7890"),
-                                    ("socks4a://localhost:1080", "socks4a://localhost:1080")):
+                                    ("http://127.0.0.1:7890", "http://127.0.0.1:7890")):
             settings = SettingsDialog(self.app)
             settings.proxy_enabled.select()
             settings.toggle_proxy()
@@ -1573,7 +1572,7 @@ class UITests(unittest.TestCase):
         folder, original = self.seed_artwork()
         self.app.storage.save_game({**self.game, "steamgrid_id": 42})
         second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
-        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "http://127.0.0.1:7890"})
         self.app.api_key = "test-key"
         self.app.artwork_controls[3].invoke()
         self.wait_for_artwork()
@@ -1585,7 +1584,7 @@ class UITests(unittest.TestCase):
         job = self.app.artwork_job
         self.assertEqual(job["action"], "download_one")
         self.assertEqual(job["game"]["id"], self.game["id"])
-        self.assertEqual(job["network"]["proxy_url"], "socks5h://127.0.0.1:7890")
+        self.assertEqual(job["network"]["proxy_url"], "http://127.0.0.1:7890")
         self.wait_for_artwork()
         manifest = json.loads((folder / "assets.json").read_text())
         self.assertEqual(manifest["assets"]["wide"]["id"], 101)
@@ -1833,6 +1832,38 @@ class UITests(unittest.TestCase):
         self.assertTrue(settings.winfo_exists())
         self.assertEqual((self.root / "data" / "library.json").read_bytes(), previous)
         settings.destroy()
+
+    def test_legacy_socks_proxy_is_rejected_without_saving(self):
+        from game_manager.ui import SettingsDialog
+        for protocol in ("socket", "socks", "socks4", "socks4a", "socks5", "socks5h"):
+            with self.subTest(protocol=protocol):
+                settings = SettingsDialog(self.app)
+                settings.proxy_enabled.select()
+                settings.toggle_proxy()
+                settings.proxy_url.insert(0, f"{protocol}://127.0.0.1:7890")
+                previous = (self.root / "data" / "library.json").read_bytes()
+                with patch("game_manager.ui.messagebox.showerror") as error:
+                    settings.save()
+                self.assertIn("HTTP", error.call_args.args[1])
+                self.assertIn("HTTPS", error.call_args.args[1])
+                self.assertTrue(settings.winfo_exists())
+                self.assertEqual((self.root / "data" / "library.json").read_bytes(), previous)
+                settings.destroy()
+
+    def test_disabling_legacy_socks_proxy_saves_and_uses_direct_connection(self):
+        from game_manager.network import settings_proxy_url
+        from game_manager.ui import SettingsDialog
+        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socks5h://127.0.0.1:7890"})
+        settings = SettingsDialog(self.app)
+        settings.proxy_enabled.deselect()
+        settings.toggle_proxy()
+        with patch("game_manager.ui.messagebox.showerror") as error:
+            settings.save()
+        error.assert_not_called()
+        stored = Storage(self.root / "data").settings
+        self.assertFalse(stored["proxy_enabled"])
+        self.assertEqual(stored["proxy_url"], "socks5h://127.0.0.1:7890")
+        self.assertEqual(settings_proxy_url(stored), "")
 
     @patch("game_manager.ui.artwork_worker", held_artwork_worker)
     def test_artwork_process_keeps_ui_and_backups_available_and_stops(self):

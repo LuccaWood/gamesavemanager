@@ -5,7 +5,7 @@ from unittest import mock
 
 import requests
 
-from game_manager.network import NetworkError
+from game_manager.network import NetworkError, settings_proxy_url
 from game_manager.steam import SteamError, lookup_steam_name, steam_name_worker
 
 
@@ -48,9 +48,37 @@ class SteamTests(unittest.TestCase):
                 create_session.assert_not_called()
 
     def test_proxy_and_direct_mode_use_shared_network_configuration(self):
-        for proxy in ("", "http://127.0.0.1:7890", "socket://127.0.0.1:7890", "https://user:secret@127.0.0.1:7890"):
+        for proxy in ("", "http://127.0.0.1:7890", "https://user:secret@127.0.0.1:7890"):
             with self.subTest(proxy=proxy):
                 self.assertEqual(self.lookup(self.response(), proxy_url=proxy)[0], "Dota 2")
+
+    def test_legacy_socket_and_socks_proxy_fail_before_steam_request(self):
+        for scheme in ("socket", "socks4", "socks4a", "socks5", "socks5h"):
+            proxy = f"{scheme}://PrivateUser:PrivatePassword@127.0.0.1:7890"
+            with self.subTest(scheme=scheme), mock.patch("requests.Session.get") as get:
+                with self.assertRaisesRegex(SteamError, "HTTP.*HTTPS") as caught:
+                    lookup_steam_name("570", proxy)
+                self.assertNotIn("PrivateUser", str(caught.exception))
+                self.assertNotIn("PrivatePassword", str(caught.exception))
+                get.assert_not_called()
+
+    def test_disabled_legacy_proxy_and_environment_are_ignored_by_steam_session(self):
+        settings = {"proxy_enabled": False, "proxy_url": "socks5h://127.0.0.1:7890"}
+        seen = []
+
+        def get(session, *args, **kwargs):
+            seen.append((session.trust_env, session.proxies.copy()))
+            return self.response()
+
+        with mock.patch.dict("os.environ", {"HTTP_PROXY": "http://environment:7890",
+                                            "HTTPS_PROXY": "http://environment:7890"}), \
+                mock.patch("requests.Session.get", autospec=True, side_effect=get):
+            self.assertEqual(lookup_steam_name("570", settings_proxy_url(settings)), "Dota 2")
+        self.assertEqual(seen, [(False, {})])
+        settings["proxy_enabled"] = True
+        with mock.patch("requests.Session.get") as request, self.assertRaisesRegex(NetworkError, "HTTP.*HTTPS"):
+            lookup_steam_name("570", settings_proxy_url(settings))
+        request.assert_not_called()
 
     def test_missing_application_is_reported_and_resources_are_closed(self):
         response = self.response()

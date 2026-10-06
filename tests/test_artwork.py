@@ -1,8 +1,6 @@
 import io
 import json
-import socketserver
 import tempfile
-import threading
 import traceback
 import unittest
 from pathlib import Path
@@ -276,10 +274,7 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
         environment = {"HTTP_PROXY": "http://environment.invalid:11", "HTTPS_PROXY": "http://environment.invalid:12",
                        "ALL_PROXY": "http://environment.invalid:13", "NO_PROXY": "*"}
         with tempfile.TemporaryDirectory() as directory:
-            for index, proxy_url in enumerate(("", "http://127.0.0.1:7890", "https://127.0.0.1:7890",
-                                               "socks4://127.0.0.1:7890", "socks4a://127.0.0.1:7890",
-                                               "socks5://127.0.0.1:7890", "socks5h://127.0.0.1:7890",
-                                               "socket://127.0.0.1:7890")):
+            for index, proxy_url in enumerate(("", "http://127.0.0.1:7890", "https://127.0.0.1:7890")):
                 with self.subTest(proxy_url=proxy_url):
                     client = SteamGridDB("private-test-key", proxy_url=proxy_url)
                     staging = Path(directory) / str(index)
@@ -292,8 +287,7 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
                                 patch("requests.sessions.get_netrc_auth", side_effect=AssertionError("读取了系统认证")):
                             self.assertEqual(client.search("Game"), [{"id": 42, "name": "Game", "release_date": None}])
                             client._download("https://cdn2.steamgriddb.com/grid/1.png", staging, "cover", (600, 900))
-                        normalized = proxy_url.replace("socket://", "socks5h://")
-                        expected = {"http": normalized, "https": normalized} if normalized else {}
+                        expected = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
                         self.assertEqual(len(adapter.calls), 2)
                         for request, options in adapter.calls:
                             self.assertEqual(options["proxies"], expected)
@@ -307,12 +301,13 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
         self.assertEqual(SteamGridDB.validate_proxy_url(""), "")
         self.assertEqual(SteamGridDB.validate_proxy_url(" HTTP://ProxyUsernameSecret:Secret@localhost:7890 "),
                          "http://ProxyUsernameSecret:Secret@localhost:7890")
-        for scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h", "socket"):
+        for scheme in ("http", "https"):
             with self.subTest(scheme=scheme):
-                normalized = "socks5h" if scheme == "socket" else scheme
                 self.assertEqual(SteamGridDB.validate_proxy_url(f" {scheme.upper()}://user:Secret@[::1]:7890 "),
-                                 f"{normalized}://user:Secret@[::1]:7890")
+                                 f"{scheme}://user:Secret@[::1]:7890")
         for value in ("localhost:7890", "ftp://ProxyUsernameSecret:Secret@localhost:7890", "socks6://localhost:7890",
+                      "socks4://localhost:7890", "socks4a://localhost:7890", "socks5://localhost:7890",
+                      "socks5h://localhost:7890", "socket://localhost:7890",
                       "http://localhost", "http://localhost:0", "http://localhost:65536",
                       "http://localhost:abc", "http://localhost:7890/path", "http://localhost:7890?password=Secret",
                       "http://localhost:7890#Secret", "http://:7890", "http://local\nhost:7890"):
@@ -327,14 +322,15 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
                     self.fail("无效代理地址未被拒绝")
 
     @patch("game_manager.artwork.requests.Session.get")
-    def test_proxy_tls_and_dependency_errors_explain_failure_without_secrets(self, get):
-        client = SteamGridDB("private-test-key", proxy_url="socks5h://ProxyUsernameSecret:Secret@localhost:7890")
+    def test_proxy_tls_protocol_and_auth_errors_explain_failure_without_secrets(self, get):
+        client = SteamGridDB("private-test-key", proxy_url="http://ProxyUsernameSecret:Secret@localhost:7890")
         cases = (
             (requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED"), "证书验证失败"),
             (requests.exceptions.SSLError("WRONG_VERSION_NUMBER"), "TLS 握手失败"),
-            (requests.exceptions.InvalidSchema("Missing dependencies for SOCKS support."), "缺少 SOCKS"),
-            (requests.ConnectionError("SOCKS5 proxy server sent invalid data"), "SOCKS 代理握手失败"),
-            (requests.ConnectionError("SOCKS5 authentication failed"), "代理认证失败"),
+            (requests.exceptions.InvalidSchema("No connection adapters were found"), "不支持当前代理协议"),
+            (requests.exceptions.ProxyError("407 Proxy Authentication Required"), "代理认证失败"),
+            (requests.exceptions.ProxyError("Cannot connect to proxy"), "无法连接代理"),
+            (requests.Timeout("timed out"), "连接超时"),
         )
         try:
             for failure, expected in cases:
@@ -355,30 +351,15 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
         finally:
             client.close()
 
-    def test_socket_proxy_to_http_only_port_reports_socks_handshake_failure(self):
-        received = []
-
-        class HTTPOnlyProxy(socketserver.BaseRequestHandler):
-            def handle(self):
-                self.request.settimeout(2)
-                with self.request.makefile("rb") as greeting:
-                    received.append(greeting.read(3))
-                self.request.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-
-        with socketserver.TCPServer(("127.0.0.1", 0), HTTPOnlyProxy) as proxy:
-            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-            thread.start()
-            client = SteamGridDB("private-test-key", f"socket://127.0.0.1:{proxy.server_address[1]}")
-            try:
-                with self.assertRaisesRegex(ArtworkError, "SOCKS 代理握手失败") as raised:
-                    client.search("Game")
-                self.assertIn("http://", str(raised.exception))
-                self.assertEqual(received, [b"\x05\x01\x00"])
-                self.assertEqual(client._session.proxies["https"].split("://", 1)[0], "socks5h")
-            finally:
-                client.close()
-                proxy.shutdown()
-                thread.join(timeout=2)
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_unsupported_proxy_protocols_are_rejected_before_request(self, get):
+        for scheme in ("socket", "socks4", "socks4a", "socks5", "socks5h"):
+            with self.subTest(scheme=scheme), self.assertRaises(ArtworkError) as raised:
+                SteamGridDB("private-test-key", f"{scheme}://ProxyUsernameSecret:Secret@localhost:7890")
+            details = "".join(traceback.format_exception(raised.exception))
+            for secret in ("private-test-key", "ProxyUsernameSecret", "Secret"):
+                self.assertNotIn(secret, details)
+        get.assert_not_called()
 
     @patch("game_manager.artwork.requests.Session.get")
     def test_proxy_request_errors_hide_key_and_password(self, get):
@@ -463,9 +444,8 @@ class SharedNetworkSettingsTests(unittest.TestCase):
     def test_supported_proxy_protocols_create_real_managers_without_connecting(self):
         from game_manager import network
         from urllib3 import ProxyManager
-        from urllib3.contrib.socks import SOCKSProxyManager
 
-        for scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h", "socket"):
+        for scheme in ("http", "https"):
             with self.subTest(scheme=scheme):
                 proxy_url = network.settings_proxy_url({"proxy_enabled": True,
                                                         "proxy_url": f"{scheme}://user:Secret@localhost:7890"})
@@ -473,16 +453,10 @@ class SharedNetworkSettingsTests(unittest.TestCase):
                     self.assertFalse(session.trust_env)
                     self.assertTrue(session.verify)
                     manager = session.get_adapter("https://").proxy_manager_for(proxy_url)
-                    if scheme in ("http", "https"):
-                        self.assertIsInstance(manager, ProxyManager)
-                        self.assertEqual(manager.proxy.scheme, scheme)
-                    else:
-                        self.assertIsInstance(manager, SOCKSProxyManager)
-                        options = manager.connection_pool_kw["_socks_options"]
-                        self.assertEqual(options["rdns"], scheme in ("socks4a", "socks5h", "socket"))
-                        self.assertEqual(options["proxy_port"], 7890)
-                        self.assertEqual(options["username"], "user")
-                        self.assertEqual(options["password"], "Secret")
+                    self.assertIsInstance(manager, ProxyManager)
+                    self.assertEqual(manager.proxy.scheme, scheme)
+                    self.assertEqual(manager.proxy.port, 7890)
+                    self.assertEqual(manager.proxy.auth, "user:Secret")
 
     def test_unchecked_global_proxy_ignores_saved_invalid_address_and_environment(self):
         from game_manager import network

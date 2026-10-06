@@ -7,6 +7,7 @@ from unittest import mock
 import requests
 
 from game_manager.pcgamingwiki import PCGamingWiki, PCGamingWikiError, _lookup_steam_cloud, pcgw_worker
+from game_manager.network import NetworkError
 
 
 HTML = r'''
@@ -177,8 +178,8 @@ class PCGamingWikiTests(unittest.TestCase):
             result = [{"path": r"%LOCALAPPDATA%\Game", "resolved": True, "source": "Steam 云存档"}]
             with self.subTest(error=error), mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client), \
                     mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud", return_value=result) as fallback:
-                pcgw_worker(connection, "socks5h://127.0.0.1:7890", "Game")
-            fallback.assert_called_once_with("socks5h://127.0.0.1:7890", "Game")
+                pcgw_worker(connection, "http://127.0.0.1:7890", "Game")
+            fallback.assert_called_once_with("http://127.0.0.1:7890", "Game")
             connection.send.assert_called_once_with((True, result))
             client.close.assert_called_once()
             connection.close.assert_called_once()
@@ -263,8 +264,8 @@ class PCGamingWikiTests(unittest.TestCase):
         client.search_games.return_value = [{"id": 11, "name": "Game", "source": "Steam 云存档"},
                                            {"id": 12, "name": "Game II", "source": "Steam 云存档"}]
         with mock.patch("game_manager.steam_cloud.SteamCloud", return_value=client) as factory:
-            result = _lookup_steam_cloud("socks5h://localhost:7890", "Game")
-        factory.assert_called_once_with("socks5h://localhost:7890")
+            result = _lookup_steam_cloud("https://localhost:7890", "Game")
+        factory.assert_called_once_with("https://localhost:7890")
         self.assertEqual(result, {"games": client.search_games.return_value, "source": "Steam 云存档"})
         client.find_save_locations.assert_not_called()
         client.close.assert_called_once()
@@ -381,6 +382,16 @@ class PCGamingWikiTests(unittest.TestCase):
             self.assertEqual(proxy._session.proxies, {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"})
         with self.assertRaisesRegex(PCGamingWikiError, "英文名"):
             client.find_save_locations(" ")
+
+    def test_legacy_proxy_is_rejected_before_wiki_request(self):
+        for proxy in ("socket://PrivateUser:PrivatePassword@localhost:7890",
+                      "socks5h://PrivateUser:PrivatePassword@localhost:7890"):
+            with self.subTest(proxy=proxy), mock.patch("requests.Session.get") as get:
+                with self.assertRaisesRegex(NetworkError, "HTTP.*HTTPS") as caught:
+                    PCGamingWiki(proxy)
+                self.assertNotIn("PrivateUser", str(caught.exception))
+                self.assertNotIn("PrivatePassword", str(caught.exception))
+                get.assert_not_called()
 
     def test_worker_success_failure_and_cleanup(self):
         connection = mock.Mock()

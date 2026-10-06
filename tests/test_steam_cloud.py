@@ -9,6 +9,7 @@ from unittest import mock
 import requests
 
 from game_manager.steam_cloud import SteamCloud, SteamCloudError, _known_folder
+from game_manager.network import NetworkError
 
 
 class SteamCloudTests(unittest.TestCase):
@@ -246,8 +247,8 @@ class SteamCloudTests(unittest.TestCase):
 
     def test_shared_proxy_session_and_explicit_close(self):
         with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://environment:1234"}):
-            for proxy, expected in (("", {}), ("socket://127.0.0.1:7890", {
-                    "http": "socks5h://127.0.0.1:7890", "https": "socks5h://127.0.0.1:7890"})):
+            for proxy, expected in (("", {}), ("https://127.0.0.1:7890", {
+                    "http": "https://127.0.0.1:7890", "https": "https://127.0.0.1:7890"})):
                 client = SteamCloud(proxy)
                 try:
                     self.assertEqual(client._session.proxies, expected)
@@ -259,6 +260,16 @@ class SteamCloudTests(unittest.TestCase):
             client = SteamCloud("http://127.0.0.1:7890")
         client.close()
         session.close.assert_called_once()
+
+    def test_legacy_proxy_is_rejected_before_cloud_request(self):
+        for proxy in ("socket://PrivateUser:PrivatePassword@localhost:7890",
+                      "socks5h://PrivateUser:PrivatePassword@localhost:7890"):
+            with self.subTest(proxy=proxy), mock.patch("requests.Session.get") as get:
+                with self.assertRaisesRegex(NetworkError, "HTTP.*HTTPS") as caught:
+                    SteamCloud(proxy)
+                self.assertNotIn("PrivateUser", str(caught.exception))
+                self.assertNotIn("PrivatePassword", str(caught.exception))
+                get.assert_not_called()
 
 
 if __name__ == "__main__":

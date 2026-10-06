@@ -243,11 +243,11 @@ class SettingsDialog(ctk.CTkToplevel):
         if app.storage.settings.get("proxy_enabled") is True:
             self.proxy_enabled.select()
         self.proxy_enabled.pack(anchor="w", padx=24, pady=(20, 8))
-        self.proxy_url = ctk.CTkEntry(self, height=38, placeholder_text="http://、https:// 或 socket://127.0.0.1:7890")
+        self.proxy_url = ctk.CTkEntry(self, height=38, placeholder_text="http://127.0.0.1:7890 或 https://代理主机:端口")
         self.proxy_url.insert(0, app.storage.settings.get("proxy_url", ""))
         self.proxy_url.pack(fill="x", padx=24)
         self.toggle_proxy()
-        ctk.CTkLabel(self, text="支持 HTTP、HTTPS 和 SOCKS；socket:// 是 SOCKS5 兼容写法。\n"
+        ctk.CTkLabel(self, text="仅支持 HTTP 和 HTTPS 代理。\n"
                      "用于 Steam、SteamGridDB、PCGamingWiki 和 SteamCMD；去除勾选后本机直连。", text_color=MUTED,
                      justify="left").pack(
             anchor="w", padx=24, pady=(6, 0))

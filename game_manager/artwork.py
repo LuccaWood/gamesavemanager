@@ -404,14 +404,8 @@ class SteamGridDB:
         elif isinstance(error, requests.exceptions.SSLError):
             message = "TLS 握手失败，请检查代理协议及 HTTPS 连接。"
         elif isinstance(error, requests.exceptions.InvalidSchema):
-            message = ("当前运行环境缺少 SOCKS 支持，请安装 requests[socks] 后重新构建 EXE 或运行。"
-                       if "Missing dependencies for SOCKS support" in details
-                       else "联网组件不支持当前代理协议，请检查运行环境和代理协议。")
-        elif any(marker in details for marker in ("SOCKS5 proxy server sent invalid data", "SOCKS4 proxy server sent invalid data")):
-            message = ("SOCKS 代理握手失败，代理端口未返回有效的 SOCKS 响应。"
-                       "如果该端口提供 HTTP 代理，请填写 http://；socket:// 要求 SOCKS5 服务。")
-        elif any(marker in details for marker in ("SOCKS5 authentication failed", "No username/password supplied",
-                                                  "All offered SOCKS5 authentication methods were rejected", "407 Proxy Authentication Required")):
+            message = "联网组件不支持当前代理协议，请检查运行环境和代理协议。"
+        elif "407 Proxy Authentication Required" in details:
             message = "代理认证失败，请检查代理认证信息。"
         elif isinstance(error, requests.Timeout):
             message = "连接超时，请检查代理连接或目标网站访问后重试。"

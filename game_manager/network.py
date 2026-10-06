@@ -21,15 +21,15 @@ def validate_proxy_url(value: str) -> str:
         if any(character.isspace() or ord(character) < 32 for character in value):
             raise ValueError("代理地址包含空白")
         parsed = urlsplit(value)
-        scheme = "socks5h" if parsed.scheme == "socket" else parsed.scheme
-        if (scheme not in ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+        scheme = parsed.scheme
+        if (scheme not in ("http", "https")
                 or not parsed.hostname or parsed.port is None
                 or not 1 <= parsed.port <= 65535 or parsed.path or parsed.query or parsed.fragment
                 or parsed.netloc.count("@") > 1 or (parsed.password is not None and not parsed.username)):
             raise ValueError("代理地址结构无效")
         return f"{scheme}://{parsed.netloc}"
     except (TypeError, ValueError):
-        raise NetworkError("代理地址无效，请使用 协议://主机:端口，支持 HTTP、HTTPS、SOCKS4/4a、SOCKS5/5h 和 socket。") from None
+        raise NetworkError("代理地址无效，请使用 http://主机:端口 或 https://主机:端口，仅支持 HTTP 和 HTTPS。") from None
 
 
 def create_session(proxy_url: str = "") -> requests.Session:
