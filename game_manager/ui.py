@@ -389,12 +389,15 @@ class SaveLocationDialog(ctk.CTkToplevel):
         hint = ("以下目录由 Steam 云同步规则推导，仅适用于 Steam 版本，请确认后使用。\n"
                 "含账号占位符或不明确的位置需手动填写。" if steam_cloud else
                 "请选择对应版本。含占位符、注册表或不明确的位置需手动填写。")
+        hint += "\n选中需要的文字，按 Ctrl+C（macOS 为 ⌘C）复制全部或部分内容。"
         ctk.CTkLabel(self, text=hint, text_color=MUTED, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
         frame = ctk.CTkScrollableFrame(self)
         frame.pack(fill="both", expand=True, padx=20, pady=(0, 12))
         for candidate in candidates:
-            ctk.CTkLabel(frame, text=f"{candidate['label']}\n{candidate['path']}", anchor="w",
-                         justify="left", wraplength=640).pack(fill="x", pady=(8, 4))
+            text = ctk.CTkTextbox(frame, height=90, wrap="word", exportselection=False)
+            text.insert("1.0", f"{candidate['label']}\n{candidate['path']}")
+            text.configure(state="disabled")
+            text.pack(fill="x", pady=(8, 4))
             ctk.CTkButton(frame, text="使用此目录" if candidate["resolved"] else "需手动填写",
                           state="normal" if candidate["resolved"] else "disabled",
                           command=lambda item=candidate: self.choose(item, callback)).pack(anchor="w", pady=(0, 8))

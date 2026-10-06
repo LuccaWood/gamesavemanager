@@ -1435,6 +1435,61 @@ class UITests(unittest.TestCase):
         self.assertEqual(stored["save_path"], candidates[1]["path"])
         self.assertEqual(stored["chinese_name"], "修改后资料")
 
+    def test_save_location_contents_allow_partial_copy_without_editing_or_confirming(self):
+        from tkinter import TclError
+        from customtkinter import CTkButton, CTkTextbox
+        from game_manager.ui import SaveLocationDialog
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        try:
+            original_clipboard = self.app.clipboard_get()
+        except TclError:
+            original_clipboard = None
+        try:
+            for source in ("PCGamingWiki", "Steam 云存档"):
+                game = self.app.storage.save_game({"english_name": f"Copy Paths {source}"})
+                candidates = [{"label": "Windows · 文件规则：*.sav", "path": r"%LOCALAPPDATA%\中文游戏\Saved",
+                               "source": source, "resolved": True, "page_url": "https://example.invalid/game"},
+                              {"label": "Steam 账号目录", "path": "<Steam-folder>\\userdata\\<user-id>\\"
+                               + "long-directory-" * 25, "source": source, "resolved": False,
+                               "page_url": "https://example.invalid/game"}]
+                callbacks = []
+                self.app.open_dialog(SaveLocationDialog, game, candidates, callbacks.append)
+                dialog = self.app.dialog
+                textboxes = [widget for widget in descendants(dialog) if isinstance(widget, CTkTextbox)]
+                self.assertEqual(len(textboxes), 2)
+                for textbox, candidate in zip(textboxes, candidates):
+                    text = f"{candidate['label']}\n{candidate['path']}"
+                    self.assertEqual(textbox.get("1.0", "end-1c"), text)
+                    self.assertEqual(textbox._textbox.cget("state"), "disabled")
+                    textbox.insert("end", "不应修改")
+                    textbox.delete("1.0", "end")
+                    self.assertEqual(textbox.get("1.0", "end-1c"), text)
+                    textbox.tag_add("sel", "2.0", "2.14")
+                    self.app.clipboard_clear()
+                    self.app.clipboard_append("copy-test-placeholder")
+                    textbox._textbox.event_generate("<<Copy>>")
+                    self.assertEqual(self.app.clipboard_get(), candidate["path"][:14])
+                    textbox.tag_remove("sel", "1.0", "end")
+                    textbox.tag_add("sel", "1.0", "end-1c")
+                    textbox._textbox.event_generate("<<Copy>>")
+                    self.assertEqual(self.app.clipboard_get(), text)
+                    self.assertEqual(callbacks, [])
+                    self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+                buttons = [widget for widget in descendants(dialog) if isinstance(widget, CTkButton)
+                           and widget.cget("text") in ("使用此目录", "需手动填写")]
+                self.assertEqual([button.cget("state") for button in buttons], ["normal", "disabled"])
+                buttons[0].invoke()
+                self.assertEqual(callbacks, [candidates[0]])
+        finally:
+            self.app.clipboard_clear()
+            if original_clipboard is not None:
+                self.app.clipboard_append(original_clipboard)
+
     def test_save_lookup_uses_global_proxy_and_needs_no_api_key(self):
         with patch("game_manager.ui.pcgw_worker", proxy_save_location_worker):
             for enabled, url, expected in ((False, "invalid stored proxy", "Direct"),
