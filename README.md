@@ -1,6 +1,6 @@
 # 游戏存档管理器
 
-使用 CustomTkinter 的 Python 桌面应用。Windows 10/11 为主要运行目标，macOS 可运行源码进行调试。
+自用的游戏存档管理工具，使用 CustomTkinter 的 Python 桌面应用。Windows 10/11 为主要运行目标，macOS 可运行源码进行调试。
 
 ## 功能
 
