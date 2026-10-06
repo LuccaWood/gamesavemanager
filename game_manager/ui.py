@@ -671,8 +671,9 @@ class GameManagerApp(ctk.CTk):
         self.refresh_status()
         self.lookup_save_path(self.selected_game())
 
-    def refresh(self):
-        current_tab = self.tabs.get() if hasattr(self, "tabs") and self.tabs.winfo_exists() else "存档备份"
+    def refresh(self, target_tab=None):
+        current_tab = target_tab or (
+            self.tabs.get() if hasattr(self, "tabs") and self.tabs.winfo_exists() else "存档备份")
         self.refresh_sidebar()
         for widget in self.content.winfo_children():
             widget.destroy()
@@ -1546,8 +1547,7 @@ class GameManagerApp(ctk.CTk):
             return
         def complete(result):
             self.selected_id = result["game"]["id"]
-            self.refresh()
-            self.tabs.set("存档备份")
+            self.refresh(target_tab="存档备份")
             summary = f"导入完成：新增 {result['imported']} 条备份，跳过 {result['skipped']} 条重复备份。"
             if result.get("cleanup_warning"):
                 summary += "\n" + result["cleanup_warning"]

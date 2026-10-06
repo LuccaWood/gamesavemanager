@@ -1960,6 +1960,35 @@ class UITests(unittest.TestCase):
         self.wait_for_task()
         self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
 
+    def test_import_from_export_tab_keeps_loaded_backup_table_visible(self):
+        from game_manager.backups import BackupManager
+        source_storage = Storage(self.root / "source-library")
+        source_game = source_storage.save_game(self.game, allow_new_id=True)
+        source_backups = BackupManager(source_storage)
+        backup = source_backups.create(source_game)
+        source_backups.update_note(source_game, backup["id"], "导入后的备注")
+        package = source_backups.export(source_game)
+        self.app.deiconify()
+        with patch("game_manager.ui.filedialog.askopenfilename", return_value=str(package)):
+            for attempt in range(2):
+                self.app.tabs.set("数据打包")
+                deadline = time.monotonic() + 0.2
+                while time.monotonic() < deadline:
+                    self.app.update()
+                    time.sleep(0.01)
+                self.app.import_archive()
+                self.wait_for_task()
+                deadline = time.monotonic() + 0.25
+                while time.monotonic() < deadline:
+                    self.app.update()
+                    time.sleep(0.01)
+                with self.subTest(attempt=attempt):
+                    self.assertEqual(self.app.tabs.get(), "存档备份")
+                    self.assertEqual(self.app.backup_table.get_children(), (backup["id"],))
+                    self.assertEqual(self.app.backup_table.item(backup["id"], "values")[3], "导入后的备注")
+                    self.assertTrue(self.app.tabs.tab("存档备份").winfo_ismapped())
+                    self.assertTrue(self.app.backup_table.winfo_ismapped())
+
     def test_import_cancel_and_invalid_package_leave_library_unchanged(self):
         self.app.backups.create(self.game)
         exported = self.app.backups.export(self.game)
