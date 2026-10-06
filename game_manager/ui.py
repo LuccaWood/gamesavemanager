@@ -21,10 +21,11 @@ import webbrowser
 import customtkinter as ctk
 from PIL import Image, ImageOps
 
-from .artwork import ArtworkError, artwork_worker
+from .artwork import ArtworkError, artwork_worker, merge_assets, replace_local_asset
 from .backups import BackupManager
 from .network import NetworkError, settings_proxy_url, validate_proxy_url
 from .pcgamingwiki import pcgw_worker
+from .steam import steam_name_worker
 from .storage import Storage
 
 
@@ -32,6 +33,7 @@ BG = "#11151e"
 PANEL = "#1a2130"
 MUTED = "#96a4b9"
 ACCENT = "#5b83f6"
+ARTWORK_TITLES = {"cover": "竖版封面", "wide": "横版大图", "hero": "标题背景", "logo": "游戏 Logo"}
 
 
 def open_folder(path: Path) -> None:
@@ -63,6 +65,9 @@ class GameDialog(ctk.CTkToplevel):
         super().__init__(app)
         self.app = app
         self.game = game or {}
+        self.steam_job = None
+        self.steam_poll = None
+        self.browse_buttons = []
         self.title("编辑游戏" if game else "添加游戏")
         self.geometry("660x480")
         self.resizable(False, False)
@@ -71,7 +76,7 @@ class GameDialog(ctk.CTkToplevel):
         ctk.CTkLabel(self, text="游戏资料", font=ctk.CTkFont(size=23, weight="bold")).grid(
             row=0, column=0, columnspan=3, padx=24, pady=(22, 12), sticky="w")
         self.entries = {}
-        fields = [("english_name", "英文名 *"), ("chinese_name", "中文名"),
+        fields = [("english_name", "英文名 / App ID *"), ("chinese_name", "中文名"),
                   ("game_path", "游戏本体目录"), ("save_path", "存档目录")]
         for row, (key, label) in enumerate(fields, 1):
             ctk.CTkLabel(self, text=label).grid(row=row, column=0, padx=(24, 12), pady=10, sticky="w")
@@ -81,14 +86,16 @@ class GameDialog(ctk.CTkToplevel):
                        padx=(0, 24), pady=10, sticky="ew")
             self.entries[key] = entry
             if key.endswith("path"):
-                ctk.CTkButton(self, text="浏览…", width=74, command=lambda e=entry: self.browse(e)).grid(
-                    row=row, column=2, padx=(0, 24), pady=10)
-        ctk.CTkLabel(self, text="仅英文名必填。存档目录留空时自动查询 PCGamingWiki，支持系统环境变量。",
-                     text_color=MUTED).grid(row=5, column=0, columnspan=3, padx=24, pady=8, sticky="w")
+                button = ctk.CTkButton(self, text="浏览…", width=74, command=lambda e=entry: self.browse(e))
+                button.grid(row=row, column=2, padx=(0, 24), pady=10)
+                self.browse_buttons.append(button)
+        ctk.CTkLabel(self, text="英文名必填；纯数字按 Steam App ID 查询名称后保存。\n"
+                     "存档目录留空时自动查询 PCGamingWiki，支持系统环境变量。",
+                     text_color=MUTED, justify="left").grid(row=5, column=0, columnspan=3, padx=24, pady=8, sticky="w")
         self.error = ctk.CTkLabel(self, text="", text_color="#ff9d9d", wraplength=600)
         self.error.grid(row=6, column=0, columnspan=3, padx=24, sticky="w")
-        ctk.CTkButton(self, text="保存游戏", height=40, command=self.save).grid(
-            row=7, column=1, columnspan=2, padx=24, pady=18, sticky="e")
+        self.save_button = ctk.CTkButton(self, text="保存游戏", height=40, command=self.save)
+        self.save_button.grid(row=7, column=1, columnspan=2, padx=24, pady=18, sticky="e")
         self.bind("<Return>", lambda _: self.save())
         self.bind("<Escape>", lambda _: self.destroy())
         self.after(100, self.activate)
@@ -98,14 +105,24 @@ class GameDialog(ctk.CTkToplevel):
         self.entries["english_name"].focus_set()
 
     def browse(self, entry):
+        if self.steam_job is not None:
+            return
         selected = filedialog.askdirectory(parent=self, title="选择目录")
         if selected:
             entry.delete(0, "end")
             entry.insert(0, selected)
 
     def save(self):
+        if self.steam_job is not None or self.app._closing:
+            return
         values = dict(self.game)
         values.update({key: entry.get().strip() for key, entry in self.entries.items()})
+        if values["english_name"].isdecimal():
+            self.resolve_steam_name(values)
+            return
+        self.save_values(values)
+
+    def save_values(self, values):
         if values.get("english_name") != self.game.get("english_name"):
             values["steamgrid_id"] = None
         try:
@@ -118,13 +135,96 @@ class GameDialog(ctk.CTkToplevel):
         self.destroy()
         self.app.lookup_save_path(saved)
 
+    def set_lookup_state(self, querying):
+        state = "disabled" if querying else "normal"
+        for widget in list(self.entries.values()) + self.browse_buttons + [self.save_button]:
+            widget.configure(state=state)
+        self.save_button.configure(text="正在查询 Steam…" if querying else "保存游戏")
+
+    def resolve_steam_name(self, values):
+        receiver = sender = process = None
+        try:
+            proxy_url = settings_proxy_url(self.app.storage.settings)
+            context = multiprocessing.get_context("spawn")
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(target=steam_name_worker,
+                                      args=(sender, proxy_url, values["english_name"]), daemon=True)
+            process.start()
+        except Exception as exc:
+            if receiver is not None:
+                receiver.close()
+            if process is not None:
+                process.close()
+            self.error.configure(text=str(exc) if isinstance(exc, NetworkError) else "无法启动 Steam 查询，请重试。")
+            return
+        finally:
+            if sender is not None:
+                sender.close()
+        self.steam_job = {"process": process, "receiver": receiver, "values": values, "proxy_url": proxy_url}
+        self.set_lookup_state(True)
+        self.error.configure(text="正在根据 Steam App ID 查询英文名称；关闭窗口可取消。")
+        self.steam_poll = self.after(100, self.poll_steam_name)
+
+    def poll_steam_name(self):
+        self.steam_poll = None
+        job = self.steam_job
+        if job is None:
+            return
+        if self.app._closing:
+            self.destroy()
+            return
+        if "result" not in job and job["receiver"].poll():
+            try:
+                job["result"] = job["receiver"].recv()
+            except (EOFError, OSError):
+                job["result"] = (False, "Steam 查询进程异常退出，请重试。")
+        if job["process"].is_alive():
+            self.steam_poll = self.after(100, self.poll_steam_name)
+            return
+        if "result" not in job and job["receiver"].poll():
+            try:
+                job["result"] = job["receiver"].recv()
+            except (EOFError, OSError):
+                job["result"] = (False, "Steam 查询进程异常退出，请重试。")
+        success, result = job.get("result", (False, "Steam 查询进程异常退出，请重试。"))
+        self.stop_steam_lookup()
+        self.set_lookup_state(False)
+        if not success:
+            self.error.configure(text=result)
+            return
+        self.entries["english_name"].delete(0, "end")
+        self.entries["english_name"].insert(0, result)
+        self.save_values({**job["values"], "english_name": result})
+
+    def stop_steam_lookup(self):
+        if self.steam_poll is not None:
+            self.after_cancel(self.steam_poll)
+            self.steam_poll = None
+        job, self.steam_job = self.steam_job, None
+        if job is not None:
+            process = job["process"]
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=1)
+            else:
+                process.join(timeout=0)
+            job["receiver"].close()
+            process.close()
+
+    def destroy(self):
+        self.stop_steam_lookup()
+        super().destroy()
+
 
 class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, app: GameManagerApp):
         super().__init__(app)
         self.app = app
         self.title("软件设置")
-        self.geometry("590x520")
+        self.geometry("590x560")
         self.resizable(False, False)
         self.transient(app)
         ctk.CTkLabel(self, text="软件设置", font=ctk.CTkFont(size=23, weight="bold")).pack(
@@ -138,15 +238,17 @@ class SettingsDialog(ctk.CTkToplevel):
         if app.storage.settings.get("api_key"):
             self.remember.select()
         self.remember.pack(anchor="w", padx=24)
-        self.proxy_enabled = ctk.CTkCheckBox(self, text="为软件联网请求使用 HTTP 代理", command=self.toggle_proxy)
+        self.proxy_enabled = ctk.CTkCheckBox(self, text="为软件联网请求使用代理", command=self.toggle_proxy)
         if app.storage.settings.get("proxy_enabled") is True:
             self.proxy_enabled.select()
         self.proxy_enabled.pack(anchor="w", padx=24, pady=(20, 8))
-        self.proxy_url = ctk.CTkEntry(self, height=38, placeholder_text="http://127.0.0.1:7890")
+        self.proxy_url = ctk.CTkEntry(self, height=38, placeholder_text="http://、https:// 或 socket://127.0.0.1:7890")
         self.proxy_url.insert(0, app.storage.settings.get("proxy_url", ""))
         self.proxy_url.pack(fill="x", padx=24)
         self.toggle_proxy()
-        ctk.CTkLabel(self, text="用于 SteamGridDB 和 PCGamingWiki；去除勾选后本机直连。", text_color=MUTED).pack(
+        ctk.CTkLabel(self, text="支持 HTTP、HTTPS 和 SOCKS；socket:// 是 SOCKS5 兼容写法。\n"
+                     "用于 Steam、SteamGridDB 和 PCGamingWiki；去除勾选后本机直连。", text_color=MUTED,
+                     justify="left").pack(
             anchor="w", padx=24, pady=(6, 0))
         ctk.CTkButton(self, text="打开 API Key 申请页面 ↗", fg_color="transparent", border_width=1,
                       command=lambda: webbrowser.open("https://www.steamgriddb.com/profile/preferences")).pack(
@@ -165,7 +267,7 @@ class SettingsDialog(ctk.CTkToplevel):
             if enabled:
                 proxy_url = validate_proxy_url(proxy_url)
                 if not proxy_url:
-                    raise NetworkError("请填写 HTTP 代理地址。")
+                    raise NetworkError("请填写代理地址。")
             self.app.storage.update_settings({"api_key": key if self.remember.get() else "",
                                               "proxy_enabled": enabled, "proxy_url": proxy_url})
         except (OSError, NetworkError) as exc:
@@ -210,17 +312,20 @@ class LibraryTransferDialog(ctk.CTkToplevel):
 
 
 class GameChoiceDialog(ctk.CTkToplevel):
-    def __init__(self, app: GameManagerApp, candidates: list[dict], callback):
+    def __init__(self, app: GameManagerApp, candidates: list[dict], callback, source="SteamGridDB"):
         super().__init__(app)
-        self.title("选择 SteamGridDB 游戏")
+        self.title("选择 PCGamingWiki 匹配文章" if source == "PCGamingWiki" else "选择 SteamGridDB 游戏")
         self.geometry("560x470")
         self.transient(app)
-        ctk.CTkLabel(self, text="请选择对应游戏", font=ctk.CTkFont(size=21, weight="bold")).pack(
+        ctk.CTkLabel(self, text="请选择准确的游戏文章" if source == "PCGamingWiki" else "请选择对应游戏",
+                     font=ctk.CTkFont(size=21, weight="bold")).pack(
             anchor="w", padx=20, pady=18)
         frame = ctk.CTkScrollableFrame(self)
         frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         for candidate in candidates:
-            ctk.CTkButton(frame, text=f"{candidate['name']}  ·  ID {candidate['id']}", height=42,
+            name = candidate["title"] if source == "PCGamingWiki" else candidate["name"]
+            identity = candidate["pageid"] if source == "PCGamingWiki" else candidate["id"]
+            ctk.CTkButton(frame, text=f"{name}  ·  ID {identity}", height=42,
                           anchor="w", command=lambda item=candidate: self.choose(item, callback)).pack(
                 fill="x", pady=5)
         self.after(100, self.grab_set)
@@ -264,6 +369,69 @@ class SaveLocationDialog(ctk.CTkToplevel):
         app.open_dialog(GameDialog, current)
 
 
+class ArtworkChoiceDialog(ctk.CTkToplevel):
+    def __init__(self, app: GameManagerApp, game: dict, network: dict, result: dict, temporary: Path):
+        super().__init__(app)
+        self.app, self.game, self.network, self.result = app, game, network, result
+        self.temporary = temporary
+        self.images = []
+        self.select_buttons = {}
+        self.title(f"选择{ARTWORK_TITLES[result['kind']]}")
+        self.geometry("880x680")
+        self.minsize(760, 500)
+        self.transient(app)
+        ctk.CTkLabel(self, text=f"{game['english_name']} · {ARTWORK_TITLES[result['kind']]}",
+                     font=ctk.CTkFont(size=21, weight="bold")).pack(anchor="w", padx=20, pady=(18, 8))
+        ctk.CTkLabel(self, text=f"第 {result['page'] + 1} 页 · 选择一张图片替换当前类型，其它图片保留。",
+                     text_color=MUTED).pack(anchor="w", padx=20, pady=(0, 12))
+        frame = ctk.CTkScrollableFrame(self)
+        frame.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        for column in range(3):
+            frame.grid_columnconfigure(column, weight=1, uniform="choices")
+        for index, candidate in enumerate(result["candidates"]):
+            card = ctk.CTkFrame(frame, fg_color=PANEL)
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=4, pady=4)
+            filename = candidate.get("preview_file", "")
+            preview = None
+            if filename and Path(filename).name == filename and "\\" not in filename:
+                preview = app.preview(temporary / "artwork" / filename, (200, 160), image_store=self.images)
+            ctk.CTkLabel(card, text="" if preview else "无缩略图", image=preview, width=200, height=160,
+                         text_color=MUTED).pack(padx=8, pady=(10, 4))
+            ctk.CTkLabel(card, text=f"ID {candidate['id']} · {candidate.get('width', '?')} × {candidate.get('height', '?')}",
+                         text_color=MUTED).pack()
+            ctk.CTkLabel(card, text=candidate.get("author", {}).get("name") or "作者未提供",
+                         wraplength=200).pack(padx=8, pady=(0, 6))
+            button = ctk.CTkButton(card, text="使用这张", command=lambda item=candidate: self.choose(item))
+            button.pack(padx=8, pady=(0, 10))
+            self.select_buttons[candidate["id"]] = button
+        if not result["candidates"]:
+            ctk.CTkLabel(frame, text="本页没有符合规格的图片，可返回上一页或取消。").grid(
+                row=0, column=0, columnspan=3, padx=16, pady=40)
+        controls = ctk.CTkFrame(self, fg_color="transparent")
+        controls.pack(fill="x", padx=20, pady=(0, 16))
+        self.previous_button = ctk.CTkButton(controls, text="上一页", state="normal" if result["page"] else "disabled",
+                                             command=lambda: self.change_page(result["page"] - 1))
+        self.previous_button.pack(side="left")
+        self.next_button = ctk.CTkButton(controls, text="下一页", state="normal" if result["has_next"] else "disabled",
+                                         command=lambda: self.change_page(result["page"] + 1))
+        self.next_button.pack(side="left", padx=10)
+        ctk.CTkButton(controls, text="取消", fg_color="#303b51", command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda _: self.destroy())
+        self.after(100, self.grab_set)
+
+    def choose(self, candidate):
+        self.destroy()
+        self.app.download_single_artwork(self.game, self.network, self.result["game_id"], self.result["kind"], candidate)
+
+    def change_page(self, page):
+        self.destroy()
+        self.app.load_artwork_gallery(self.game, self.network, self.result["game_id"], self.result["kind"], page)
+
+    def destroy(self):
+        super().destroy()
+        shutil.rmtree(self.temporary, ignore_errors=True)
+
+
 class GameManagerApp(ctk.CTk):
     def __init__(self, data_dir: Path):
         ctk.set_appearance_mode("dark")
@@ -290,6 +458,7 @@ class GameManagerApp(ctk.CTk):
         self._closing = False
         self.results = queue.Queue()
         self.action_buttons = []
+        self.artwork_controls = []
         self.game_buttons = []
         self.images = []
         self.export_paths = {}
@@ -342,6 +511,17 @@ class GameManagerApp(ctk.CTk):
     def set_status(self, text):
         self.status.configure(text=text)
 
+    def refresh_status(self):
+        if self.busy:
+            return
+        job = self.artwork_job
+        if job is None:
+            self.set_status("就绪")
+        elif job["cancelled"]:
+            self.set_status("正在停止存档目录查询…" if job["action"] == "save_lookup" else "正在停止图片获取…")
+        else:
+            self.set_status(job["status"])
+
     def selected_game(self):
         return self.storage.get_game(self.selected_id) if self.selected_id else None
 
@@ -376,6 +556,7 @@ class GameManagerApp(ctk.CTk):
             return
         self.selected_id = game_id
         self.refresh()
+        self.refresh_status()
         self.lookup_save_path(self.selected_game())
 
     def refresh(self):
@@ -384,6 +565,7 @@ class GameManagerApp(ctk.CTk):
         for widget in self.content.winfo_children():
             widget.destroy()
         self.action_buttons = []
+        self.artwork_controls = []
         self.images = []
         game = self.selected_game()
         if not game:
@@ -414,7 +596,7 @@ class GameManagerApp(ctk.CTk):
             if key == "save_path" and not game.get(key, "").strip():
                 self.button(paths, "查询目录", lambda: self.lookup_save_path(game, force=True), width=85,
                             fg_color="#28334a").grid(row=row, column=2, padx=(6, 0), pady=3)
-        tabs = ctk.CTkTabview(self.content, fg_color=PANEL)
+        tabs = ctk.CTkTabview(self.content, fg_color=PANEL, command=self.refresh_status)
         self.tabs = tabs
         tabs.grid(row=3, column=0, sticky="nsew")
         self.render_backups(tabs.add("存档备份"), game)
@@ -443,7 +625,7 @@ class GameManagerApp(ctk.CTk):
         except (OSError, ValueError):
             return {"assets": {}, "warning": "图片来源记录损坏，请重新获取图片。"}
 
-    def preview(self, path, size, crop=False):
+    def preview(self, path, size, crop=False, image_store=None):
         try:
             with Image.open(path) as source:
                 image = source.convert("RGBA")
@@ -455,7 +637,7 @@ class GameManagerApp(ctk.CTk):
                 canvas.alpha_composite(image, ((size[0] - image.width) // 2, (size[1] - image.height) // 2))
                 image = canvas
             result = ctk.CTkImage(light_image=image, dark_image=image, size=size)
-            self.images.append(result)
+            (self.images if image_store is None else image_store).append(result)
             return result
         except (OSError, ValueError):
             return None
@@ -539,6 +721,7 @@ class GameManagerApp(ctk.CTk):
 
     def render_artwork(self, parent, game):
         parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
         bar = ctk.CTkFrame(parent, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
         self.artwork_button = self.button(bar, "搜索并获取图片", self.search_artwork, width=145)
@@ -550,10 +733,13 @@ class GameManagerApp(ctk.CTk):
         self.button(bar, "查看网站 ↗", lambda: webbrowser.open(
             f"https://www.steamgriddb.com/game/{game['steamgrid_id']}" if game.get("steamgrid_id")
             else "https://www.steamgriddb.com"), width=110, fg_color="#303b51").pack(side="left")
-        ctk.CTkLabel(parent, text="按指定尺寸获取静态图片；缺图会保留提示。搜索同名游戏时可选择匹配结果。",
+        ctk.CTkLabel(parent, text="可更改本地图片，或按指定规格再搜索并选择一张图片。搜索同名游戏时可选择匹配结果。",
                      text_color=MUTED, wraplength=750).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
-        cards = ctk.CTkFrame(parent, fg_color="transparent")
-        cards.grid(row=2, column=0, sticky="ew", padx=12)
+        body = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        body.grid_columnconfigure(0, weight=1)
+        cards = ctk.CTkFrame(body, fg_color="transparent")
+        cards.grid(row=0, column=0, sticky="ew")
         manifest = self.artwork_manifest(game)
         assets = manifest.get("assets", {})
         for column, (key, title, dimensions) in enumerate((
@@ -569,12 +755,21 @@ class GameManagerApp(ctk.CTk):
                          text_color=MUTED).pack(padx=8, pady=(12, 6))
             ctk.CTkLabel(card, text=title, font=ctk.CTkFont(weight="bold")).pack()
             ctk.CTkLabel(card, text=dimensions, text_color=MUTED).pack(pady=(0, 8))
+            controls = ctk.CTkFrame(card, fg_color="transparent")
+            controls.pack(fill="x", padx=6, pady=(0, 10))
+            for text, callback in (("更改", lambda k=key: self.change_artwork(game, k)),
+                                   ("再搜索", lambda k=key: self.search_artwork_kind(game, k))):
+                button = self.button(controls, text, callback, width=66, height=30, fg_color="#303b51")
+                button.pack(side="left", expand=True, fill="x", padx=2)
+                self.artwork_controls.append(button)
+                if self.artwork_job is not None:
+                    button.configure(state="disabled")
         if manifest.get("missing"):
-            ctk.CTkLabel(parent, text="该游戏缺少图片：" + "、".join(manifest["missing"]),
-                         text_color="#e4bd7e").grid(row=3, column=0, padx=12, pady=12, sticky="w")
+            ctk.CTkLabel(body, text="该游戏缺少图片：" + "、".join(manifest["missing"]),
+                         text_color="#e4bd7e").grid(row=1, column=0, padx=12, pady=12, sticky="w")
         if manifest.get("warning"):
-            ctk.CTkLabel(parent, text=manifest["warning"], text_color="#ff9d9d").grid(
-                row=4, column=0, padx=12, pady=12, sticky="w")
+            ctk.CTkLabel(body, text=manifest["warning"], text_color="#ff9d9d").grid(
+                row=2, column=0, padx=12, pady=12, sticky="w")
 
     def render_export(self, parent, game):
         parent.grid_columnconfigure(0, weight=1)
@@ -760,26 +955,45 @@ class GameManagerApp(ctk.CTk):
             if game is None:
                 continue
             try:
-                network = {"proxy_url": settings_proxy_url(self.storage.settings)}
+                network = pending["network"] if "network" in pending else {"proxy_url": settings_proxy_url(self.storage.settings)}
             except NetworkError as exc:
                 self.show_error(exc)
                 return
-            self.start_artwork_job("save_lookup", game, network, game["english_name"])
+            self.start_artwork_job("save_lookup", game, network, pending.get("value", game["english_name"]))
             if self.artwork_job is not None:
                 self.artwork_job["on_resolved"] = pending["on_resolved"]
             return
 
-    def save_location_results(self, game, candidates, on_resolved):
+    def save_location_results(self, game, candidates, on_resolved, network=None):
         current = self.current_lookup_game(game)
         if current is None:
             return
-        if not candidates:
+        if isinstance(candidates, dict) and "games" in candidates:
+            self.set_status(f"请为 {game['english_name']} 选择准确的 PCGamingWiki 游戏文章。")
+            self.open_dialog(GameChoiceDialog, candidates["games"],
+                             lambda candidate: self.choose_save_game(game, network, candidate, on_resolved),
+                             "PCGamingWiki")
+        elif not candidates:
             self.set_status(f"PCGamingWiki 未提供 {game['english_name']} 的 Windows 存档目录，请手动填写或点击查询目录重试。")
         elif len(candidates) == 1 and candidates[0]["resolved"]:
             self.use_save_location(current, candidates[0], on_resolved)
         else:
             self.open_dialog(SaveLocationDialog, current, candidates,
                              lambda candidate: self.use_save_location(game, candidate, on_resolved))
+
+    def choose_save_game(self, game, network, candidate, on_resolved):
+        current = self.current_lookup_game(game)
+        if current is None or self._closing:
+            return
+        for pending in self.save_lookup_queue:
+            if (pending["game"]["id"], pending["game"]["english_name"]) == (current["id"], current["english_name"]):
+                self.save_lookup_queue.remove(pending)
+                if pending["on_resolved"] is not None:
+                    on_resolved = pending["on_resolved"]
+                break
+        self.save_lookup_queue.insert(0, {"game": dict(current), "network": network, "value": candidate,
+                                         "on_resolved": on_resolved})
+        self.start_pending_lookup()
 
     def use_save_location(self, game, candidate, on_resolved):
         current = self.current_lookup_game(game)
@@ -794,6 +1008,64 @@ class GameManagerApp(ctk.CTk):
         self.set_status(f"已从 PCGamingWiki 填入 {saved['english_name']} 的 Windows 存档目录：{saved['save_path']}")
         if on_resolved is not None:
             on_resolved(saved)
+
+    def change_artwork(self, game, kind):
+        if self.busy or self.artwork_job is not None or self._closing:
+            return
+        path = filedialog.askopenfilename(parent=self, title=f"更改{ARTWORK_TITLES[kind]}",
+                                          filetypes=[("静态图片", "*.png *.jpg *.jpeg *.webp"), ("所有文件", "*.*")])
+        if not path or self.busy or self.artwork_job is not None or self._closing:
+            return
+        current = self.current_artwork_game(game)
+        if current is None:
+            return
+        def work():
+            self.backups._root(current)
+            return replace_local_asset(kind, Path(path), self.storage.artwork_dir(current))
+        self.run_task(f"正在更改{ARTWORK_TITLES[kind]}…", work,
+                      lambda _: self.operation_done(f"{current['english_name']} 的{ARTWORK_TITLES[kind]}已更改。"))
+
+    def search_artwork_kind(self, game, kind):
+        if self.busy or self.artwork_job is not None or self._closing:
+            return
+        if not self.api_key:
+            self.open_dialog(SettingsDialog)
+            self.set_status("填写 API Key 后，再点击再搜索。")
+            return
+        current = self.current_artwork_game(game)
+        if current is None:
+            return
+        try:
+            network = {"api_key": self.api_key, "proxy_url": settings_proxy_url(self.storage.settings)}
+        except NetworkError as exc:
+            self.show_error(exc)
+            return
+        if current.get("steamgrid_id"):
+            self.load_artwork_gallery(current, network, current["steamgrid_id"], kind)
+        else:
+            job = self.start_artwork_job("search", current, network, current["english_name"])
+            if job is not None:
+                job["kind"] = kind
+
+    def kind_game_candidates(self, game, network, candidates, kind):
+        if not candidates:
+            messagebox.showinfo("没有匹配结果", "没有找到对应游戏，请检查英文名。", parent=self)
+            self.set_status("SteamGridDB 未找到游戏。")
+        elif len(candidates) == 1:
+            self.load_artwork_gallery(game, network, candidates[0]["id"], kind)
+        else:
+            self.open_dialog(GameChoiceDialog, candidates,
+                             lambda candidate: self.load_artwork_gallery(game, network, candidate["id"], kind))
+
+    def load_artwork_gallery(self, game, network, game_id, kind, page=0):
+        current = self.current_artwork_game(game)
+        if current is not None:
+            self.start_artwork_job("gallery", current, network, {"game_id": game_id, "kind": kind, "page": page})
+
+    def download_single_artwork(self, game, network, game_id, kind, candidate):
+        current = self.current_artwork_game(game)
+        if current is not None:
+            self.start_artwork_job("download_one", current, network, {"game_id": game_id, "kind": kind, "candidate": candidate})
 
     def search_artwork(self):
         if self.busy or self.artwork_job is not None:
@@ -866,10 +1138,14 @@ class GameManagerApp(ctk.CTk):
         self.artwork_job = {"action": action, "game": dict(game), "network": network, "value": value,
                             "temporary": temporary, "process": process, "receiver": receiver,
                             "cancelled": False}
-        self.set_status(f"正在从 PCGamingWiki 查询 {game['english_name']} 的存档目录…" if action == "save_lookup"
-                        else f"正在{'搜索' if action == 'search' else '获取'} {game['english_name']} 的图片…")
+        self.artwork_job["status"] = (f"正在从 PCGamingWiki 查询 {game['english_name']} 的存档目录…" if action == "save_lookup"
+                                      else f"正在{'搜索' if action == 'search' else '获取'} {game['english_name']} 的图片…")
+        if action in ("gallery", "download_one"):
+            self.artwork_job["status"] = f"正在{'搜索' if action == 'gallery' else '下载'} {game['english_name']} 的{ARTWORK_TITLES[value['kind']]}…"
+        self.refresh_status()
         self.set_busy_widgets()
         self.update_activity()
+        return self.artwork_job
 
     def stop_artwork(self):
         self.save_lookup_queue.clear()
@@ -892,6 +1168,8 @@ class GameManagerApp(ctk.CTk):
             raise ArtworkError("图片存储位置必须是普通文件夹。")
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = job["temporary"] / "artwork"
+        if job["action"] == "download_one":
+            merge_assets(staging, destination)
         previous = job["temporary"] / "previous"
         moved = published = False
         try:
@@ -900,7 +1178,8 @@ class GameManagerApp(ctk.CTk):
                 moved = True
             staging.rename(destination)
             published = True
-            self.storage.save_game({**game, "steamgrid_id": job["value"]})
+            game_id = job["value"]["game_id"] if job["action"] == "download_one" else job["value"]
+            self.storage.save_game({**game, "steamgrid_id": game_id})
         except Exception:
             try:
                 if published:
@@ -949,22 +1228,32 @@ class GameManagerApp(ctk.CTk):
             if not success:
                 raise NetworkError(result)
             if job["action"] == "save_lookup":
-                self.save_location_results(job["game"], result, job.get("on_resolved"))
+                self.save_location_results(job["game"], result, job.get("on_resolved"), job["network"])
                 return
             game = self.current_artwork_game(job["game"])
             if game is None:
                 return
             if job["action"] == "search":
-                self.artwork_candidates(game, job["network"], result)
+                if "kind" in job:
+                    self.kind_game_candidates(game, job["network"], result, job["kind"])
+                else:
+                    self.artwork_candidates(game, job["network"], result)
+            elif job["action"] == "gallery":
+                self.open_dialog(ArtworkChoiceDialog, game, job["network"], result, job["temporary"])
+                job["gallery_owned"] = True
+                self.set_status(f"请选择 {game['english_name']} 的{ARTWORK_TITLES[result['kind']]}。")
             else:
                 self.publish_artwork(job, game)
                 missing = result.get("missing", [])
-                self.operation_done(f"{game['english_name']} 图片获取完成。" + (
-                    "缺少：" + "、".join(missing) if missing else "四类图片已保存。"))
+                if job["action"] == "download_one":
+                    self.operation_done(f"{game['english_name']} 的{ARTWORK_TITLES[job['value']['kind']]}已更新。")
+                else:
+                    self.operation_done(f"{game['english_name']} 图片获取完成。" + (
+                        "缺少：" + "、".join(missing) if missing else "四类图片已保存。"))
         except Exception as exc:
             self.show_error(exc)
         finally:
-            if not job.get("preserve"):
+            if not job.get("preserve") and not job.get("gallery_owned"):
                 shutil.rmtree(job["temporary"], ignore_errors=True)
 
     def export_game(self):
@@ -1081,6 +1370,9 @@ class GameManagerApp(ctk.CTk):
             button.configure(state=state)
         if self.artwork_job is not None and hasattr(self, "artwork_button") and self.artwork_button.winfo_exists():
             self.artwork_button.configure(state="disabled")
+        if self.artwork_job is not None:
+            for button in self.artwork_controls:
+                button.configure(state="disabled")
 
     def update_activity(self):
         if self.busy or self.artwork_job is not None:

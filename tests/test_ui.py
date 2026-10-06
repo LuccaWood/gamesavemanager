@@ -69,6 +69,86 @@ def held_save_location_worker(connection, proxy_url, english_name):
         time.sleep(0.02)
 
 
+def choice_save_game_worker(connection, proxy_url, value):
+    if isinstance(value, str):
+        connection.send((True, {"games": [
+            {"pageid": 101, "title": "Other Match", "page_url": "https://www.pcgamingwiki.com/wiki/Other_Match"},
+            {"pageid": 202, "title": value, "page_url": "https://www.pcgamingwiki.com/wiki/Selected_Game"}]}))
+    else:
+        path = value["title"].split("|", 1)[1] if "|" in value["title"] else r"%LOCALAPPDATA%\SelectedGame"
+        connection.send((True, [{"title": value["title"], "label": "Windows", "path": path,
+                                 "page_url": value["page_url"], "resolved": True}]))
+    connection.close()
+
+
+def held_selected_save_game_worker(connection, proxy_url, value):
+    if isinstance(value, str):
+        choice_save_game_worker(connection, proxy_url, value)
+    else:
+        held_save_location_worker(connection, proxy_url, value["title"])
+
+
+def gallery_artwork_worker(connection, api_key, proxy_url, action, value, destination=None):
+    from PIL import Image
+    sizes = {"cover": (600, 900), "wide": (920, 430), "hero": (1920, 620), "logo": (300, 120)}
+    if action == "search":
+        result = [{"id": 42, "name": "Test Game"}]
+    else:
+        folder = Path(destination)
+        folder.mkdir()
+        kind = value["kind"]
+        if action == "gallery":
+            page = value["page"]
+            candidates = []
+            for index in range(2):
+                asset_id = 100 + page * 2 + index
+                filename = f"preview-{asset_id}.png"
+                Image.new("RGB", (120, 120), "red" if index == 0 else "blue").save(folder / filename)
+                candidates.append({"id": asset_id, "url": f"https://cdn2.steamgriddb.com/grid/{asset_id}.png",
+                                   "width": sizes[kind][0], "height": sizes[kind][1], "preview_file": filename,
+                                   "author": {"name": f"Author {asset_id}"}})
+            result = {"game_id": value["game_id"], "kind": kind, "page": page, "has_next": page == 0,
+                      "candidates": candidates}
+        else:
+            filename = kind + (".png" if kind == "logo" else ".jpg")
+            Image.new("RGB", sizes[kind], "blue").save(folder / filename)
+            result = {"game_id": value["game_id"], "assets": {kind: {"file": filename, "id": value["candidate"]["id"]}}, "missing": []}
+            (folder / "assets.json").write_text(json.dumps(result))
+        if api_key == "held":
+            (folder.parent / "started").touch()
+            while not (folder.parent / "release").exists():
+                time.sleep(0.02)
+    connection.send((True, result))
+    connection.close()
+
+
+def choice_gallery_artwork_worker(connection, api_key, proxy_url, action, value, destination=None):
+    if action == "search":
+        choice_artwork_worker(connection, api_key, proxy_url, action, value, destination)
+    else:
+        gallery_artwork_worker(connection, api_key, proxy_url, action, value, destination)
+
+
+def steam_name_worker(connection, proxy_url, app_id):
+    connection.send((True, {570: "Dota 2", 123: "Other Game", 2048: "2048"}[int(app_id)]))
+    connection.close()
+
+
+def failed_steam_name_worker(connection, proxy_url, app_id):
+    connection.send((False, "Steam 未找到该编号，请检查编号。"))
+    connection.close()
+
+
+def held_steam_name_worker(connection, proxy_url, app_id):
+    connection.send((True, "Dota 2"))
+    while True:
+        time.sleep(0.02)
+
+
+def empty_steam_name_worker(connection, proxy_url, app_id):
+    connection.close()
+
+
 @unittest.skipUnless(os.environ.get("GAME_MANAGER_GUI_TESTS") == "1", "需要可用桌面会话")
 class UITests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +205,30 @@ class UITests(unittest.TestCase):
                         and self.app.artwork_job["action"] == "download"
                         and (self.app.artwork_job["temporary"] / "started").exists())
         return self.app.artwork_job
+
+    def choose_pcgw_article(self, page_id):
+        from customtkinter import CTkButton
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        buttons = [widget for widget in descendants(self.app.dialog) if isinstance(widget, CTkButton)
+                   and widget.cget("text").endswith(f"ID {page_id}")]
+        self.assertEqual(len(buttons), 1)
+        buttons[0].invoke()
+
+    def seed_artwork(self):
+        from PIL import Image
+        folder = self.app.storage.artwork_dir(self.game)
+        folder.mkdir(parents=True)
+        for kind, size, color in (("cover", (600, 900), "red"), ("hero", (1920, 620), "green")):
+            Image.new("RGB", size, color).save(folder / f"{kind}.png")
+        manifest = {"game_id": 42, "notes": "keep", "assets": {
+            "cover": {"file": "cover.png"}, "hero": {"file": "hero.png"}}, "missing": ["wide", "logo"]}
+        (folder / "assets.json").write_text(json.dumps(manifest))
+        return folder, {path.name: path.read_bytes() for path in folder.iterdir()}
 
     def test_backup_copy_restore_export_and_delete_through_ui(self):
         self.app.create_backup()
@@ -266,6 +370,176 @@ class UITests(unittest.TestCase):
         saved = json.loads((self.root / "data" / "library.json").read_text())
         self.assertEqual(saved["settings"]["api_key"], "")
 
+    @patch("game_manager.ui.steam_name_worker", steam_name_worker, create=True)
+    def test_numeric_game_name_resolves_in_background_before_saving(self):
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, " 000570 ")
+        dialog.entries["chinese_name"].insert(0, "刀塔")
+        dialog.entries["save_path"].insert(0, str(self.save_dir))
+        dialog.save()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(len(self.app.storage.games), 1)
+        self.assertEqual(dialog.save_button.cget("state"), "disabled")
+        self.assertEqual(dialog.steam_job["proxy_url"], "")
+        self.wait_until(lambda: len(self.app.storage.games) == 2)
+        saved = self.app.selected_game()
+        self.assertEqual(saved["english_name"], "Dota 2")
+        self.assertEqual(saved["chinese_name"], "刀塔")
+        self.assertEqual(saved["save_path"], str(self.save_dir))
+        self.assertEqual(saved["steamgrid_id"], "")
+        self.assertEqual(Storage(self.root / "data").get_game(saved["id"])["english_name"], "Dota 2")
+
+    @patch("game_manager.ui.steam_name_worker", steam_name_worker)
+    def test_edit_numeric_name_uses_resolved_name_to_preserve_or_clear_image_id(self):
+        from game_manager.ui import GameDialog
+        game = self.app.storage.save_game({**self.game, "english_name": "Dota 2", "steamgrid_id": 73})
+        for app_id, expected_name, expected_grid in (("570", "Dota 2", 73), ("123", "Other Game", "")):
+            self.app.open_dialog(GameDialog, game)
+            dialog = self.app.dialog
+            dialog.entries["english_name"].delete(0, "end")
+            dialog.entries["english_name"].insert(0, app_id)
+            dialog.save()
+            self.wait_until(lambda: not dialog.winfo_exists())
+            game = self.app.storage.get_game(game["id"])
+            self.assertEqual(game["english_name"], expected_name)
+            self.assertEqual(game["steamgrid_id"], expected_grid)
+            self.assertEqual(game["save_path"], str(self.save_dir))
+            self.assertEqual(game["chinese_name"], self.game["chinese_name"])
+        self.assertEqual(len(self.app.storage.games), 1)
+
+    def test_steam_name_failure_keeps_form_and_allows_retry(self):
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, "570")
+        dialog.entries["save_path"].insert(0, str(self.save_dir))
+        with patch("game_manager.ui.steam_name_worker", failed_steam_name_worker):
+            dialog.save()
+            self.wait_until(lambda: dialog.steam_job is None)
+        self.assertEqual(dialog.entries["english_name"].get(), "570")
+        self.assertIn("未找到", dialog.error.cget("text"))
+        self.assertEqual(len(self.app.storage.games), 1)
+        self.assertEqual(dialog.save_button.cget("state"), "normal")
+        with patch("game_manager.ui.steam_name_worker", steam_name_worker):
+            dialog.save()
+            self.wait_until(lambda: not dialog.winfo_exists())
+        self.assertEqual(self.app.selected_game()["english_name"], "Dota 2")
+
+    @patch("game_manager.ui.steam_name_worker", steam_name_worker)
+    def test_steam_resolved_duplicate_is_rejected_and_numeric_title_saves_once(self):
+        self.app.storage.save_game({"english_name": "Dota 2", "save_path": str(self.save_dir)})
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, "570")
+        dialog.entries["save_path"].insert(0, str(self.save_dir))
+        dialog.save()
+        self.wait_until(lambda: dialog.steam_job is None)
+        self.assertIn("已存在同名游戏", dialog.error.cget("text"))
+        self.assertEqual(len(self.app.storage.games), 2)
+        self.assertEqual(dialog.entries["english_name"].get(), "Dota 2")
+        dialog.entries["english_name"].delete(0, "end")
+        dialog.entries["english_name"].insert(0, "2048")
+        dialog.save()
+        self.wait_until(lambda: not dialog.winfo_exists())
+        self.assertEqual(len(self.app.storage.games), 3)
+        self.assertEqual(self.app.selected_game()["english_name"], "2048")
+
+    @patch("game_manager.ui.steam_name_worker", held_steam_name_worker)
+    def test_steam_query_blocks_repeated_save_and_window_close_discards_late_result(self):
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, "570")
+        dialog.save()
+        job = dialog.steam_job
+        self.wait_until(lambda: "result" in job)
+        self.assertEqual(len(self.app.storage.games), 1)
+        dialog.save()
+        self.assertIs(dialog.steam_job, job)
+        for widget in list(dialog.entries.values()) + dialog.browse_buttons + [dialog.save_button]:
+            self.assertEqual(widget.cget("state"), "disabled")
+        with patch("game_manager.ui.filedialog.askdirectory") as picker:
+            dialog.browse(dialog.entries["save_path"])
+            picker.assert_not_called()
+        self.app.tk.call(dialog.protocol("WM_DELETE_WINDOW"))
+        self.assertIsNone(dialog.steam_job)
+        self.assertIsNone(dialog.steam_poll)
+        self.assertTrue(job["process"]._closed)
+        self.assertTrue(job["receiver"].closed)
+        self.app.update()
+        self.assertEqual(len(self.app.storage.games), 1)
+
+    @patch("game_manager.ui.steam_name_worker", steam_name_worker)
+    @patch("game_manager.ui.pcgw_worker", save_location_worker)
+    def test_steam_query_uses_proxy_snapshot_then_pcgamingwiki_uses_resolved_name(self):
+        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, "570")
+        dialog.save()
+        self.assertEqual(dialog.steam_job["proxy_url"], "socks5h://127.0.0.1:7890")
+        self.app.storage.update_settings({"proxy_enabled": False})
+        self.wait_until(lambda: not dialog.winfo_exists())
+        self.assertEqual(self.app.artwork_job["value"], "Dota 2")
+        self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "")
+        self.wait_for_artwork()
+        self.assertEqual(self.app.selected_game()["save_path"], r"%LOCALAPPDATA%\TestGame\Saved")
+
+    def test_steam_query_start_failure_and_process_exit_keep_original_data(self):
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, "570")
+        with patch.object(multiprocessing.process.BaseProcess, "start", side_effect=OSError("start failed")):
+            dialog.save()
+        self.assertIsNone(dialog.steam_job)
+        self.assertIn("无法启动", dialog.error.cget("text"))
+        with patch("game_manager.ui.steam_name_worker", empty_steam_name_worker):
+            dialog.save()
+            job = dialog.steam_job
+            self.wait_until(lambda: dialog.steam_job is None)
+        self.assertIn("异常退出", dialog.error.cget("text"))
+        self.assertEqual(dialog.save_button.cget("state"), "normal")
+        self.assertTrue(job["process"]._closed)
+        self.assertEqual(dialog.entries["english_name"].get(), "570")
+        self.assertEqual(len(self.app.storage.games), 1)
+
+    @patch("game_manager.ui.steam_name_worker", steam_name_worker)
+    def test_resolved_steam_name_write_failure_preserves_original_game_and_can_retry(self):
+        from game_manager.ui import GameDialog
+        game = self.app.storage.save_game({**self.game, "steamgrid_id": 73})
+        library = (self.app.storage.data_dir / "library.json").read_bytes()
+        self.app.open_dialog(GameDialog, game)
+        dialog = self.app.dialog
+        dialog.entries["english_name"].delete(0, "end")
+        dialog.entries["english_name"].insert(0, "570")
+        with patch.object(self.app.storage, "_save", side_effect=OSError("disk full")):
+            dialog.save()
+            self.wait_until(lambda: dialog.steam_job is None)
+        self.assertEqual(self.app.storage.get_game(game["id"]), game)
+        self.assertEqual((self.app.storage.data_dir / "library.json").read_bytes(), library)
+        self.assertIn("disk full", dialog.error.cget("text"))
+        self.assertEqual(dialog.entries["english_name"].get(), "Dota 2")
+        dialog.save()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.app.storage.get_game(game["id"])["english_name"], "Dota 2")
+
+    @patch("game_manager.ui.steam_name_worker", held_steam_name_worker)
+    @patch("game_manager.ui.artwork_worker", held_artwork_worker)
+    def test_closing_app_cancels_steam_name_query_alongside_artwork(self):
+        self.start_held_download()
+        self.app.add_game()
+        dialog = self.app.dialog
+        dialog.entries["english_name"].insert(0, "570")
+        dialog.save()
+        job = dialog.steam_job
+        self.wait_until(lambda: "result" in job)
+        with patch.object(self.app, "destroy") as destroy:
+            self.app.close()
+            self.wait_for_artwork()
+            self.wait_until(lambda: dialog.steam_job is None)
+            destroy.assert_called_once()
+        self.assertTrue(job["process"]._closed)
+        self.assertEqual(len(self.app.storage.games), 1)
+
     def test_blank_save_path_is_looked_up_and_persisted(self):
         with patch("game_manager.ui.pcgw_worker", save_location_worker, create=True):
             self.app.add_game()
@@ -282,8 +556,141 @@ class UITests(unittest.TestCase):
         settings = SettingsDialog(self.app)
         self.assertEqual(settings.title(), "软件设置")
         self.assertEqual(self.app.settings_button.cget("text"), "软件设置")
-        self.assertEqual(settings.proxy_enabled.cget("text"), "为软件联网请求使用 HTTP 代理")
+        self.assertEqual(settings.proxy_enabled.cget("text"), "为软件联网请求使用代理")
         settings.destroy()
+
+    def test_switching_games_and_tabs_clears_previous_failure_status(self):
+        second = self.app.storage.save_game({"english_name": "Another Game", "save_path": str(self.save_dir)})
+        self.app.show_error(RuntimeError("上次获取失败"))
+        self.app.select(second["id"])
+        self.assertEqual(self.app.status.cget("text"), "就绪")
+        self.app.show_error(RuntimeError("再次获取失败"))
+        self.app.tabs._segmented_button._buttons_dict["游戏图片"].invoke()
+        self.assertEqual(self.app.status.cget("text"), "就绪")
+
+    def test_multiple_pcgw_games_are_chosen_before_loading_save_paths(self):
+        from game_manager.ui import GameChoiceDialog
+        with patch("game_manager.ui.pcgw_worker", choice_save_game_worker):
+            game = self.app.storage.save_game({"english_name": "Selected Game"})
+            self.app.select(game["id"])
+            self.wait_for_artwork()
+            self.assertIsInstance(self.app.dialog, GameChoiceDialog)
+            self.assertEqual(self.app.dialog.title(), "选择 PCGamingWiki 匹配文章")
+            self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+            self.choose_pcgw_article(202)
+            self.wait_for_artwork()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], r"%LOCALAPPDATA%\SelectedGame")
+        self.assertEqual(self.app.storage.get_game(game["id"])["english_name"], "Selected Game")
+
+    def test_switching_cards_preserves_active_artwork_status(self):
+        second = self.app.storage.save_game({"english_name": "Another Game", "save_path": str(self.save_dir)})
+        with patch("game_manager.ui.artwork_worker", held_artwork_worker):
+            job = self.start_held_download()
+            self.app.select(second["id"])
+            self.assertEqual(self.app.status.cget("text"), job["status"])
+            self.app.tabs._segmented_button._buttons_dict["游戏图片"].invoke()
+            self.assertEqual(self.app.status.cget("text"), job["status"])
+            self.app.stop_artwork()
+            self.wait_for_artwork()
+
+    def test_pcgw_article_choice_preserves_proxy_and_original_backup_callback(self):
+        with patch("game_manager.ui.pcgw_worker", choice_save_game_worker):
+            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+            game = self.app.storage.save_game({"english_name": "Selected|" + str(self.save_dir)})
+            self.app.select(game["id"])
+            self.app.create_backup()
+            self.app.select(self.game["id"])
+            self.wait_for_artwork()
+            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "http://localhost:8080"})
+            self.choose_pcgw_article(202)
+            self.assertEqual(self.app.artwork_job["value"]["pageid"], 202)
+            self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "socks5h://127.0.0.1:7890")
+            self.wait_for_artwork()
+            self.wait_for_task()
+        self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.assertEqual(len(self.app.backups.list_backups(self.game)), 0)
+        self.assertEqual(self.app.selected_id, self.game["id"])
+
+    def test_pcgw_article_choice_waits_for_other_network_job(self):
+        with patch("game_manager.ui.pcgw_worker", choice_save_game_worker), patch("game_manager.ui.artwork_worker", held_artwork_worker):
+            game = self.app.storage.save_game({"english_name": "Queued Article|" + str(self.save_dir)})
+            self.app.select(game["id"])
+            self.app.create_backup()
+            self.wait_for_artwork()
+            self.app.start_artwork_job("download", self.game, {"api_key": "test-key", "proxy_url": ""}, 42)
+            job = self.app.artwork_job
+            self.wait_until(lambda: (job["temporary"] / "started").exists())
+            self.choose_pcgw_article(202)
+            self.assertIs(self.app.artwork_job, job)
+            self.assertNotIn("on_resolved", job)
+            self.assertEqual(len(self.app.save_lookup_queue), 1)
+            (job["temporary"] / "release").touch()
+            self.wait_for_artwork()
+            self.wait_for_task()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], str(self.save_dir))
+        self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+
+    def test_cancel_pcgw_article_choice_does_not_fill_or_backup(self):
+        with patch("game_manager.ui.pcgw_worker", choice_save_game_worker):
+            game = self.app.storage.save_game({"english_name": "Cancelled Article"})
+            self.app.select(game["id"])
+            self.app.create_backup()
+            self.wait_for_artwork()
+            self.app.dialog.destroy()
+            self.app.update()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.assertEqual(self.app.backups.list_backups(game), [])
+        self.assertFalse(self.app.busy)
+        self.assertEqual(self.app.save_lookup_queue, [])
+
+    def test_backup_requested_while_choosing_article_uses_selected_article(self):
+        with patch("game_manager.ui.pcgw_worker", choice_save_game_worker):
+            game = self.app.storage.save_game({"english_name": "Late Backup|" + str(self.save_dir)})
+            self.app.select(game["id"])
+            self.wait_for_artwork()
+            self.app.create_backup()
+            self.choose_pcgw_article(202)
+            self.wait_for_artwork()
+            self.wait_for_task()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], str(self.save_dir))
+        self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+
+    def test_pcgw_article_choice_discards_stale_record(self):
+        with patch("game_manager.ui.pcgw_worker", choice_save_game_worker):
+            for field, value in (("save_path", str(self.save_dir)), ("english_name", "Renamed Article")):
+                game = self.app.storage.save_game({"english_name": f"Old Article {field}"})
+                self.app.select(game["id"])
+                self.wait_for_artwork()
+                self.app.storage.save_game({**game, field: value})
+                self.choose_pcgw_article(202)
+                self.assertIsNone(self.app.artwork_job)
+                self.assertEqual(self.app.storage.get_game(game["id"])[field], value)
+
+    def test_pcgw_selected_article_lookup_can_be_stopped(self):
+        with patch("game_manager.ui.pcgw_worker", held_selected_save_game_worker):
+            game = self.app.storage.save_game({"english_name": "Stop Selected Article"})
+            self.app.select(game["id"])
+            self.wait_for_artwork()
+            self.choose_pcgw_article(202)
+            job = self.app.artwork_job
+            self.wait_until(lambda: "result" in job)
+            self.app.stop_artwork()
+            self.wait_for_artwork()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+
+    def test_proxy_settings_accept_https_and_socket_alias(self):
+        from game_manager.ui import SettingsDialog
+        for proxy_url, expected in (("https://localhost:7890", "https://localhost:7890"),
+                                    ("socket://127.0.0.1:7890", "socks5h://127.0.0.1:7890"),
+                                    ("socks4a://localhost:1080", "socks4a://localhost:1080")):
+            settings = SettingsDialog(self.app)
+            settings.proxy_enabled.select()
+            settings.toggle_proxy()
+            settings.proxy_url.delete(0, "end")
+            settings.proxy_url.insert(0, proxy_url)
+            settings.save()
+            self.assertEqual(self.app.storage.settings["proxy_url"], expected)
+            self.assertTrue(self.app.storage.settings["proxy_enabled"])
 
     def test_manual_save_path_is_used_without_lookup(self):
         with patch.object(self.app, "start_artwork_job") as start:
@@ -453,6 +860,229 @@ class UITests(unittest.TestCase):
         self.app.update_idletasks()
         self.assertEqual(len(self.app.images), 5)
 
+    def test_local_artwork_change_copies_file_and_keeps_other_types(self):
+        from PIL import Image
+        folder = self.app.storage.artwork_dir(self.game)
+        folder.mkdir(parents=True)
+        Image.new("RGB", (600, 900), "red").save(folder / "cover.png")
+        Image.new("RGB", (1920, 620), "green").save(folder / "hero.png")
+        hero = (folder / "hero.png").read_bytes()
+        (folder / "assets.json").write_text(json.dumps({"game_id": 42, "notes": "keep", "assets": {
+            "cover": {"file": "cover.png"}, "hero": {"file": "hero.png"}}, "missing": ["logo"]}))
+        self.app.storage.save_game({**self.game, "steamgrid_id": 42})
+        selected = self.root / "手选封面.jpg"
+        Image.new("RGB", (123, 234), "blue").save(selected)
+        with patch("game_manager.ui.filedialog.askopenfilename", return_value=str(selected)):
+            self.app.change_artwork(self.game, "cover")
+            self.wait_for_task()
+        manifest = json.loads((folder / "assets.json").read_text())
+        self.assertEqual((folder / manifest["assets"]["cover"]["file"]).read_bytes(), selected.read_bytes())
+        self.assertFalse((folder / "cover.png").exists())
+        self.assertEqual((folder / "hero.png").read_bytes(), hero)
+        self.assertEqual(manifest["notes"], "keep")
+        self.assertEqual(manifest["missing"], ["logo"])
+        self.assertEqual(self.app.storage.get_game(self.game["id"])["steamgrid_id"], 42)
+
+    def test_each_artwork_type_has_change_and_search_controls(self):
+        self.assertEqual(len(self.app.artwork_controls), 8)
+        self.assertEqual([button.cget("text") for button in self.app.artwork_controls], ["更改", "再搜索"] * 4)
+
+    def test_cancelled_or_invalid_local_image_keeps_existing_artwork(self):
+        folder, original = self.seed_artwork()
+        with patch("game_manager.ui.filedialog.askopenfilename", return_value=""):
+            self.app.change_artwork(self.game, "cover")
+        self.assertFalse(self.app.busy)
+        invalid = self.root / "invalid.png"
+        invalid.write_bytes(b"not an image")
+        with patch("game_manager.ui.filedialog.askopenfilename", return_value=str(invalid)), \
+                patch("game_manager.ui.messagebox.showerror") as error:
+            self.app.change_artwork(self.game, "cover")
+            self.wait_for_task()
+            error.assert_called_once()
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+
+    @patch("game_manager.ui.artwork_worker", gallery_artwork_worker)
+    def test_artwork_gallery_previews_paging_and_cancel_clean_temporary_files(self):
+        from game_manager.ui import ArtworkChoiceDialog
+        folder, original = self.seed_artwork()
+        self.app.storage.save_game({**self.game, "steamgrid_id": 42})
+        self.app.api_key = "test-key"
+        self.app.search_artwork_kind(self.game, "cover")
+        self.wait_for_artwork()
+        first = self.app.dialog
+        self.assertIsInstance(first, ArtworkChoiceDialog)
+        self.assertEqual(len(first.images), 2)
+        self.assertEqual(first.previous_button.cget("state"), "disabled")
+        self.assertEqual(first.next_button.cget("state"), "normal")
+        first.next_button.invoke()
+        self.assertFalse(first.temporary.exists())
+        self.assertEqual(self.app.artwork_job["value"]["page"], 1)
+        self.wait_for_artwork()
+        second = self.app.dialog
+        self.assertEqual(set(second.select_buttons), {102, 103})
+        self.assertEqual(second.next_button.cget("state"), "disabled")
+        second.previous_button.invoke()
+        self.assertFalse(second.temporary.exists())
+        self.wait_for_artwork()
+        final = self.app.dialog
+        self.assertEqual(final.result["page"], 0)
+        final.destroy()
+        self.assertFalse(final.temporary.exists())
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+
+    @patch("game_manager.ui.artwork_worker", gallery_artwork_worker)
+    def test_selected_single_image_keeps_other_types_and_original_game_binding(self):
+        folder, original = self.seed_artwork()
+        self.app.storage.save_game({**self.game, "steamgrid_id": 42})
+        second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
+        self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+        self.app.api_key = "test-key"
+        self.app.artwork_controls[3].invoke()
+        self.wait_for_artwork()
+        dialog = self.app.dialog
+        self.app.select(second["id"])
+        self.app.storage.update_settings({"proxy_enabled": False})
+        dialog.select_buttons[101].invoke()
+        self.assertFalse(dialog.temporary.exists())
+        job = self.app.artwork_job
+        self.assertEqual(job["action"], "download_one")
+        self.assertEqual(job["game"]["id"], self.game["id"])
+        self.assertEqual(job["network"]["proxy_url"], "socks5h://127.0.0.1:7890")
+        self.wait_for_artwork()
+        manifest = json.loads((folder / "assets.json").read_text())
+        self.assertEqual(manifest["assets"]["wide"]["id"], 101)
+        self.assertEqual(manifest["notes"], "keep")
+        self.assertEqual(manifest["missing"], ["logo"])
+        for name in ("cover.png", "hero.png"):
+            self.assertEqual((folder / name).read_bytes(), original[name])
+        self.assertEqual(self.app.selected_id, second["id"])
+        self.assertFalse(self.app.storage.artwork_dir(second).exists())
+        saved = self.app.storage.get_game(self.game["id"])
+        self.assertEqual(saved["steamgrid_id"], 42)
+        with zipfile.ZipFile(self.app.backups.export(saved)) as archive:
+            self.assertEqual(archive.read("artwork/wide.jpg"), (folder / "wide.jpg").read_bytes())
+
+    @patch("game_manager.ui.artwork_worker", choice_gallery_artwork_worker)
+    def test_single_image_search_chooses_matching_game_before_gallery(self):
+        from game_manager.ui import ArtworkChoiceDialog, GameChoiceDialog
+        self.app.api_key = "test-key"
+        self.app.search_artwork_kind(self.game, "logo")
+        self.assertEqual(self.app.artwork_job["action"], "search")
+        self.wait_for_artwork()
+        self.assertIsInstance(self.app.dialog, GameChoiceDialog)
+        self.choose_pcgw_article(43)
+        self.assertEqual(self.app.artwork_job["value"], {"game_id": 43, "kind": "logo", "page": 0})
+        self.wait_for_artwork()
+        self.assertIsInstance(self.app.dialog, ArtworkChoiceDialog)
+        self.app.dialog.select_buttons[100].invoke()
+        self.wait_for_artwork()
+        folder = self.app.storage.artwork_dir(self.game)
+        manifest = json.loads((folder / "assets.json").read_text())
+        self.assertEqual(set(manifest["assets"]), {"logo"})
+        self.assertEqual(self.app.storage.get_game(self.game["id"])["steamgrid_id"], 43)
+
+    @patch("game_manager.ui.artwork_worker", gallery_artwork_worker)
+    def test_single_image_configuration_failure_rolls_back_files_and_metadata(self):
+        folder, original = self.seed_artwork()
+        self.app.storage.save_game({**self.game, "steamgrid_id": 42})
+        library = (self.app.storage.data_dir / "library.json").read_bytes()
+        self.app.download_single_artwork(self.game, {"api_key": "test-key", "proxy_url": ""}, 43, "cover", {"id": 100})
+        job = self.app.artwork_job
+        job["process"].join(timeout=3)
+        self.assertFalse(job["process"].is_alive())
+        with patch.object(self.app.storage, "_save", side_effect=OSError("configuration write failed")), \
+                patch("game_manager.ui.messagebox.showerror") as error:
+            self.wait_for_artwork()
+            error.assert_called_once()
+        self.assertFalse(job["temporary"].exists())
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        self.assertEqual((self.app.storage.data_dir / "library.json").read_bytes(), library)
+        self.assertEqual(self.app.storage.get_game(self.game["id"])["steamgrid_id"], 42)
+
+    def test_gallery_and_single_image_tasks_can_stop_and_block_manual_changes(self):
+        folder, original = self.seed_artwork()
+        value = {"game_id": 42, "kind": "cover", "page": 0, "candidate": {"id": 100}}
+        with patch("game_manager.ui.artwork_worker", gallery_artwork_worker):
+            for action in ("gallery", "download_one"):
+                with self.subTest(action=action):
+                    self.app.start_artwork_job(action, self.game, {"api_key": "held", "proxy_url": ""}, value)
+                    job = self.app.artwork_job
+                    self.wait_until(lambda: (job["temporary"] / "started").exists())
+                    self.assertTrue(all(button.cget("state") == "disabled" for button in self.app.artwork_controls))
+                    with patch("game_manager.ui.filedialog.askopenfilename") as picker:
+                        self.app.change_artwork(self.game, "cover")
+                        picker.assert_not_called()
+                    self.app.stop_artwork()
+                    self.wait_for_artwork()
+                    self.assertFalse(job["temporary"].exists())
+                    self.assertTrue(all(button.cget("state") == "normal" for button in self.app.artwork_controls))
+                    self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        with patch("game_manager.ui.artwork_worker", empty_artwork_worker), \
+                patch("game_manager.ui.messagebox.showerror") as error:
+            self.app.start_artwork_job("gallery", self.game, {"api_key": "test-key", "proxy_url": ""}, value)
+            temporary = self.app.artwork_job["temporary"]
+            self.wait_for_artwork()
+            error.assert_called_once()
+        self.assertFalse(temporary.exists())
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+
+    @patch("game_manager.ui.artwork_worker", gallery_artwork_worker)
+    def test_closing_app_with_gallery_cleans_previews_and_keeps_existing_artwork(self):
+        from game_manager.ui import GameManagerApp
+        folder, original = self.seed_artwork()
+        self.app.load_artwork_gallery(self.game, {"api_key": "test-key", "proxy_url": ""}, 42, "cover")
+        self.wait_for_artwork()
+        temporary = self.app.dialog.temporary
+        self.app.close()
+        self.assertFalse(temporary.exists())
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        self.app = GameManagerApp(self.root / "data")
+        self.app.withdraw()
+        self.app.update()
+
+    @patch("game_manager.ui.artwork_worker", gallery_artwork_worker)
+    def test_gallery_window_failure_cleans_previews_and_keeps_existing_artwork(self):
+        folder, original = self.seed_artwork()
+        self.app.load_artwork_gallery(self.game, {"api_key": "test-key", "proxy_url": ""}, 42, "cover")
+        temporary = self.app.artwork_job["temporary"]
+        with patch("game_manager.ui.ArtworkChoiceDialog", side_effect=RuntimeError("dialog failed")), \
+                patch("game_manager.ui.messagebox.showerror") as error:
+            self.wait_for_artwork()
+            error.assert_called_once()
+        self.assertFalse(temporary.exists())
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+
+    def test_artwork_controls_are_accessible_at_minimum_window_size(self):
+        folder = self.app.storage.artwork_dir(self.game)
+        folder.mkdir(parents=True)
+        (folder / "assets.json").write_text(json.dumps({"assets": {}, "missing": ["cover", "wide", "hero", "logo"]}))
+        self.app.refresh()
+        self.app.deiconify()
+        self.app.geometry("1020x720")
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        self.app.tabs._segmented_button._buttons_dict["游戏图片"].invoke()
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        from customtkinter import CTkScrollableFrame
+        tab = self.app.tabs.tab("游戏图片")
+        ancestor = self.app.artwork_controls[0].master
+        while ancestor is not None and not isinstance(ancestor, CTkScrollableFrame):
+            ancestor = ancestor.master
+        if ancestor is not None:
+            scroll = ancestor
+            scroll._parent_canvas.yview_moveto(1)
+            self.app.update()
+        bottom = tab.winfo_rooty() + tab.winfo_height()
+        for button in self.app.artwork_controls:
+            self.assertTrue(button.winfo_ismapped())
+            self.assertGreaterEqual(button.winfo_rooty(), tab.winfo_rooty())
+            self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), bottom)
+
     def test_banner_keeps_all_image_edges_visible_after_resize(self):
         from PIL import Image, ImageDraw
         artwork = self.app.storage.artwork_dir(self.game)
@@ -557,7 +1187,7 @@ class UITests(unittest.TestCase):
         settings = SettingsDialog(self.app)
         settings.proxy_enabled.select()
         settings.toggle_proxy()
-        settings.proxy_url.insert(0, "socks5://127.0.0.1:1080")
+        settings.proxy_url.insert(0, "ftp://127.0.0.1:1080")
         previous = (self.root / "data" / "library.json").read_bytes()
         with patch("game_manager.ui.messagebox.showerror") as error:
             settings.save()

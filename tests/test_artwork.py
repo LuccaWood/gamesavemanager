@@ -274,10 +274,13 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
         environment = {"HTTP_PROXY": "http://environment.invalid:11", "HTTPS_PROXY": "http://environment.invalid:12",
                        "ALL_PROXY": "http://environment.invalid:13", "NO_PROXY": "*"}
         with tempfile.TemporaryDirectory() as directory:
-            for proxy_url in ("", "http://127.0.0.1:7890"):
+            for index, proxy_url in enumerate(("", "http://127.0.0.1:7890", "https://127.0.0.1:7890",
+                                               "socks4://127.0.0.1:7890", "socks4a://127.0.0.1:7890",
+                                               "socks5://127.0.0.1:7890", "socks5h://127.0.0.1:7890",
+                                               "socket://127.0.0.1:7890")):
                 with self.subTest(proxy_url=proxy_url):
                     client = SteamGridDB("private-test-key", proxy_url=proxy_url)
-                    staging = Path(directory) / ("proxy" if proxy_url else "direct")
+                    staging = Path(directory) / str(index)
                     staging.mkdir()
                     adapter = CaptureAdapter()
                     client._session.mount("https://", adapter)
@@ -287,7 +290,8 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
                                 patch("requests.sessions.get_netrc_auth", side_effect=AssertionError("读取了系统认证")):
                             self.assertEqual(client.search("Game"), [{"id": 42, "name": "Game", "release_date": None}])
                             client._download("https://cdn2.steamgriddb.com/grid/1.png", staging, "cover", (600, 900))
-                        expected = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+                        normalized = proxy_url.replace("socket://", "socks5h://")
+                        expected = {"http": normalized, "https": normalized} if normalized else {}
                         self.assertEqual(len(adapter.calls), 2)
                         for request, options in adapter.calls:
                             self.assertEqual(options["proxies"], expected)
@@ -301,7 +305,12 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
         self.assertEqual(SteamGridDB.validate_proxy_url(""), "")
         self.assertEqual(SteamGridDB.validate_proxy_url(" HTTP://ProxyUsernameSecret:Secret@localhost:7890 "),
                          "http://ProxyUsernameSecret:Secret@localhost:7890")
-        for value in ("localhost:7890", "https://ProxyUsernameSecret:Secret@localhost:7890", "socks5://localhost:7890",
+        for scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h", "socket"):
+            with self.subTest(scheme=scheme):
+                normalized = "socks5h" if scheme == "socket" else scheme
+                self.assertEqual(SteamGridDB.validate_proxy_url(f" {scheme.upper()}://user:Secret@[::1]:7890 "),
+                                 f"{normalized}://user:Secret@[::1]:7890")
+        for value in ("localhost:7890", "ftp://ProxyUsernameSecret:Secret@localhost:7890", "socks6://localhost:7890",
                       "http://localhost", "http://localhost:0", "http://localhost:65536",
                       "http://localhost:abc", "http://localhost:7890/path", "http://localhost:7890?password=Secret",
                       "http://localhost:7890#Secret", "http://:7890", "http://local\nhost:7890"):
@@ -395,6 +404,30 @@ class ProxyAndArtworkWorkerTests(unittest.TestCase):
 
 
 class SharedNetworkSettingsTests(unittest.TestCase):
+    def test_supported_proxy_protocols_create_real_managers_without_connecting(self):
+        from game_manager import network
+        from urllib3 import ProxyManager
+        from urllib3.contrib.socks import SOCKSProxyManager
+
+        for scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h", "socket"):
+            with self.subTest(scheme=scheme):
+                proxy_url = network.settings_proxy_url({"proxy_enabled": True,
+                                                        "proxy_url": f"{scheme}://user:Secret@localhost:7890"})
+                with network.create_session(proxy_url) as session:
+                    self.assertFalse(session.trust_env)
+                    self.assertTrue(session.verify)
+                    manager = session.get_adapter("https://").proxy_manager_for(proxy_url)
+                    if scheme in ("http", "https"):
+                        self.assertIsInstance(manager, ProxyManager)
+                        self.assertEqual(manager.proxy.scheme, scheme)
+                    else:
+                        self.assertIsInstance(manager, SOCKSProxyManager)
+                        options = manager.connection_pool_kw["_socks_options"]
+                        self.assertEqual(options["rdns"], scheme in ("socks4a", "socks5h", "socket"))
+                        self.assertEqual(options["proxy_port"], 7890)
+                        self.assertEqual(options["username"], "user")
+                        self.assertEqual(options["password"], "Secret")
+
     def test_unchecked_global_proxy_ignores_saved_invalid_address_and_environment(self):
         from game_manager import network
 
@@ -438,14 +471,270 @@ class SharedNetworkSettingsTests(unittest.TestCase):
     def test_checked_global_proxy_requires_valid_nonempty_url_and_preserves_artwork_error(self):
         from game_manager import network
 
-        for value in ("", None, "https://PrivateUser:PrivatePassword@localhost:7890"):
+        for value in ("", None, "ftp://PrivateUser:PrivatePassword@localhost:7890"):
             with self.subTest(value=value), self.assertRaises(network.NetworkError) as raised:
                 network.settings_proxy_url({"proxy_enabled": True, "proxy_url": value})
             self.assertNotIn("PrivatePassword", str(raised.exception))
         with self.assertRaises(ArtworkError) as raised:
-            SteamGridDB.validate_proxy_url("https://PrivateUser:PrivatePassword@localhost:7890")
+            SteamGridDB.validate_proxy_url("ftp://PrivateUser:PrivatePassword@localhost:7890")
         self.assertIsInstance(raised.exception, network.NetworkError)
         self.assertNotIn("PrivatePassword", str(raised.exception))
+
+
+class ArtworkSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.destination = self.root / "artwork"
+        self.client = SteamGridDB("private-test-key")
+
+    def tearDown(self):
+        self.client.close()
+        self.temporary.cleanup()
+
+    def make_previous(self):
+        self.destination.mkdir()
+        (self.destination / "cover.jpg").write_bytes(image_bytes((600, 900), "JPEG"))
+        (self.destination / "hero.png").write_bytes(image_bytes((1920, 620)))
+        manifest = {"game_id": 42, "note": "保留字段", "assets": {
+            "cover": {"file": "cover.jpg", "id": 1}, "hero": {"file": "hero.png", "id": 2}},
+            "missing": ["wide", "logo"]}
+        (self.destination / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_gallery_filters_one_kind_and_downloads_preview_without_authorization(self, get):
+        item = {**candidate(), "width": 600, "height": 900, "mime": "image/png",
+                "thumb": "https://cdn2.steamgriddb.com/thumb/123.png"}
+        get.side_effect = [api_response([item]), image_response(image_bytes((120, 180)))]
+        result = self.client.gallery(42, "cover", self.destination, page=2)
+        self.assertEqual((result["game_id"], result["kind"], result["page"], result["has_next"]),
+                         (42, "cover", 2, False))
+        params = get.call_args_list[0].kwargs["params"]
+        self.assertEqual(params["dimensions"], "600x900")
+        self.assertEqual(params["limit"], 20)
+        self.assertEqual(params["page"], 2)
+        self.assertEqual(params["types"], "static")
+        self.assertEqual(result["candidates"][0]["id"], 123)
+        self.assertTrue((self.destination / result["candidates"][0]["preview_file"]).is_file())
+        self.assertNotIn("Authorization", get.call_args_list[1].kwargs["headers"])
+        self.assertFalse((self.destination / "assets.json").exists())
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_gallery_skips_wrong_format_and_size_but_keeps_pagination(self, get):
+        items = [{**candidate(index + 1), "width": 460, "height": 215, "mime": "image/png"}
+                 for index in range(20)]
+        items[0].update({"width": 600, "height": 900, "mime": "image/webp"})
+        get.return_value = api_response(items)
+        result = self.client.gallery(42, "cover", self.destination)
+        self.assertEqual(result["candidates"], [])
+        self.assertTrue(result["has_next"])
+        self.assertEqual(get.call_count, 1)
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_gallery_bad_or_unavailable_thumbnail_keeps_selectable_candidates(self, get):
+        items = [{**candidate(1), "thumb": "https://outside.invalid/thumb.png"},
+                 {**candidate(2), "thumb": "https://cdn2.steamgriddb.com/thumb/2.png"}, candidate(3)]
+        get.side_effect = [api_response(items), requests.Timeout("private-test-key")]
+        result = self.client.gallery(42, "logo", self.destination)
+        self.assertEqual([item["id"] for item in result["candidates"]], [1, 2, 3])
+        self.assertTrue(all(item["preview_file"] == "" for item in result["candidates"]))
+        self.assertEqual(get.call_count, 2)
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_download_selected_asset_downloads_only_original_and_single_manifest(self, get):
+        item = {**candidate(456), "width": 920, "height": 430, "mime": "image/jpeg"}
+        get.return_value = image_response(image_bytes((920, 430), "JPEG"))
+        manifest = self.client.download_asset(42, "wide", item, self.destination)
+        self.assertEqual(set(manifest["assets"]), {"wide"})
+        self.assertEqual(manifest["game_id"], 42)
+        self.assertEqual(manifest["assets"]["wide"]["id"], 456)
+        self.assertEqual(manifest["assets"]["wide"]["file"], "wide.jpg")
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[0], item["url"])
+        self.assertNotIn("Authorization", get.call_args.kwargs["headers"])
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_download_selected_bad_image_preserves_previous_artwork(self, get):
+        self.make_previous()
+        before = {path.name: path.read_bytes() for path in self.destination.iterdir()}
+        get.return_value = image_response(image_bytes((10, 10)))
+        with self.assertRaisesRegex(ArtworkError, "尺寸不正确"):
+            self.client.download_asset(42, "cover", candidate(), self.destination)
+        self.assertEqual({path.name: path.read_bytes() for path in self.destination.iterdir()}, before)
+        self.assertEqual(set(self.root.iterdir()), {self.destination})
+
+    def test_local_replacement_keeps_other_images_and_manifest_metadata(self):
+        previous = self.make_previous()
+        hero_bytes = (self.destination / "hero.png").read_bytes()
+        source = self.root / "my image.webp"
+        content = image_bytes((88, 77), "WEBP")
+        source.write_bytes(content)
+        result = artwork.replace_local_asset("cover", source, self.destination)
+        self.assertEqual((self.destination / "cover.webp").read_bytes(), content)
+        self.assertFalse((self.destination / "cover.jpg").exists())
+        self.assertEqual((self.destination / "hero.png").read_bytes(), hero_bytes)
+        self.assertEqual(result["assets"]["hero"], previous["assets"]["hero"])
+        self.assertEqual(result["game_id"], 42)
+        self.assertEqual(result["note"], "保留字段")
+        self.assertEqual(result["missing"], ["wide", "logo"])
+        self.assertEqual((result["assets"]["cover"]["width"], result["assets"]["cover"]["height"]), (88, 77))
+        self.assertEqual(result["assets"]["cover"]["source"], "local")
+        self.assertNotIn(str(source), json.dumps(result))
+        self.assertEqual(source.read_bytes(), content)
+
+    def test_local_image_can_be_selected_from_current_artwork_directory(self):
+        self.make_previous()
+        content = (self.destination / "hero.png").read_bytes()
+        artwork.replace_local_asset("cover", self.destination / "hero.png", self.destination)
+        self.assertEqual((self.destination / "cover.png").read_bytes(), content)
+        self.assertEqual((self.destination / "hero.png").read_bytes(), content)
+
+    def test_local_replacement_preserves_shared_file_when_new_format_would_overwrite_it(self):
+        self.make_previous()
+        manifest = json.loads((self.destination / "assets.json").read_text(encoding="utf-8"))
+        manifest["assets"]["logo"] = {"file": "cover.png"}
+        (self.destination / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+        shared_bytes = image_bytes((20, 10))
+        (self.destination / "cover.png").write_bytes(shared_bytes)
+        source = self.root / "chosen.png"
+        source.write_bytes(image_bytes((13, 17)))
+        result = artwork.replace_local_asset("cover", source, self.destination)
+        self.assertNotEqual(result["assets"]["cover"]["file"], "cover.png")
+        self.assertEqual((self.destination / "cover.png").read_bytes(), shared_bytes)
+        self.assertEqual((self.destination / result["assets"]["cover"]["file"]).read_bytes(), source.read_bytes())
+        self.assertEqual(result["assets"]["logo"]["file"], "cover.png")
+        self.assertFalse((self.destination / "cover.jpg").exists())
+
+    def test_local_replacement_preserves_shared_filename_with_different_case(self):
+        self.make_previous()
+        manifest = json.loads((self.destination / "assets.json").read_text(encoding="utf-8"))
+        manifest["assets"]["logo"] = {"file": "Cover.png"}
+        (self.destination / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+        shared_bytes = image_bytes((20, 10))
+        (self.destination / "Cover.png").write_bytes(shared_bytes)
+        source = self.root / "chosen.png"
+        source.write_bytes(image_bytes((13, 17)))
+        result = artwork.replace_local_asset("cover", source, self.destination)
+        self.assertNotEqual(result["assets"]["cover"]["file"].casefold(), "cover.png")
+        self.assertEqual((self.destination / "Cover.png").read_bytes(), shared_bytes)
+        self.assertEqual((self.destination / result["assets"]["cover"]["file"]).read_bytes(), source.read_bytes())
+        self.assertEqual(result["assets"]["logo"]["file"], "Cover.png")
+        filenames = [path.name.casefold() for path in self.destination.iterdir()]
+        self.assertEqual(len(filenames), len(set(filenames)))
+
+    def test_local_replacement_bad_or_animated_image_keeps_previous_files(self):
+        self.make_previous()
+        before = {path.name: path.read_bytes() for path in self.destination.iterdir()}
+        source = self.root / "invalid.png"
+        frames = io.BytesIO()
+        Image.new("RGB", (10, 10), "red").save(frames, format="PNG", save_all=True,
+                                             append_images=[Image.new("RGB", (10, 10), "blue")], duration=100)
+        for content in (b"broken", frames.getvalue(), image_bytes((10, 10), "GIF")):
+            with self.subTest(content_size=len(content)):
+                source.write_bytes(content)
+                with self.assertRaises(ArtworkError):
+                    artwork.replace_local_asset("cover", source, self.destination)
+                self.assertEqual({path.name: path.read_bytes() for path in self.destination.iterdir()}, before)
+
+    def test_local_publish_failure_rolls_back_previous_directory(self):
+        self.make_previous()
+        before = {path.name: path.read_bytes() for path in self.destination.iterdir()}
+        source = self.root / "chosen.png"
+        source.write_bytes(image_bytes((13, 17)))
+        original_rename = Path.rename
+
+        def fail_publish(path, target):
+            if path.name.startswith(".artwork-") and "previous" not in path.name:
+                raise OSError("模拟目录替换失败")
+            return original_rename(path, target)
+
+        with patch.object(Path, "rename", fail_publish), self.assertRaises(ArtworkError):
+            artwork.replace_local_asset("cover", source, self.destination)
+        self.assertEqual({path.name: path.read_bytes() for path in self.destination.iterdir()}, before)
+        self.assertEqual(set(self.root.iterdir()), {self.destination, source})
+
+    def test_local_publish_and_rollback_failure_reports_preserved_previous_directory(self):
+        self.make_previous()
+        before = {path.name: path.read_bytes() for path in self.destination.iterdir()}
+        source = self.root / "chosen.png"
+        source.write_bytes(image_bytes((13, 17)))
+        original_rename = Path.rename
+
+        def fail_publish_and_rollback(path, target):
+            if path.name.startswith(".artwork-"):
+                raise OSError("模拟新目录发布和旧目录回滚失败")
+            return original_rename(path, target)
+
+        with patch.object(Path, "rename", fail_publish_and_rollback), self.assertRaisesRegex(
+                ArtworkError, "回滚未完成") as raised:
+            artwork.replace_local_asset("cover", source, self.destination)
+        preserved = list(self.root.glob(".artwork-previous-*"))
+        self.assertEqual(len(preserved), 1)
+        self.assertIn(str(preserved[0]), str(raised.exception))
+        self.assertEqual({path.name: path.read_bytes() for path in preserved[0].iterdir()}, before)
+        self.assertEqual(set(self.root.iterdir()), {preserved[0], source})
+
+    def test_merge_replaces_one_kind_keeps_shared_file_and_removes_missing_kind(self):
+        self.make_previous()
+        previous = json.loads((self.destination / "assets.json").read_text(encoding="utf-8"))
+        previous["assets"]["logo"] = {"file": "cover.jpg"}
+        previous["missing"] = ["cover", "wide"]
+        (self.destination / "assets.json").write_text(json.dumps(previous), encoding="utf-8")
+        staging = self.root / "new"
+        staging.mkdir()
+        (staging / "cover.png").write_bytes(image_bytes((600, 900)))
+        (staging / "assets.json").write_text(json.dumps({"game_id": 42, "assets": {
+            "cover": {"file": "cover.png", "id": 123}}, "missing": []}), encoding="utf-8")
+        result = artwork.merge_assets(staging, self.destination)
+        self.assertEqual(result["missing"], ["wide"])
+        self.assertEqual(result["note"], "保留字段")
+        self.assertEqual(result["assets"]["hero"], previous["assets"]["hero"])
+        self.assertEqual((staging / "cover.jpg").read_bytes(), (self.destination / "cover.jpg").read_bytes())
+        self.assertTrue((staging / "cover.png").is_file())
+        self.assertEqual(json.loads((self.destination / "assets.json").read_text(encoding="utf-8")), previous)
+
+    def test_invalid_kind_page_and_unsafe_manifest_are_rejected(self):
+        with self.assertRaises(ArtworkError):
+            self.client.gallery(42, "unknown", self.destination)
+        for page in (-1, True, "1"):
+            with self.subTest(page=page), self.assertRaises(ArtworkError):
+                self.client.gallery(42, "cover", self.destination, page)
+        self.make_previous()
+        source = self.root / "chosen.png"
+        source.write_bytes(image_bytes((13, 17)))
+        manifest = json.loads((self.destination / "assets.json").read_text(encoding="utf-8"))
+        manifest["assets"]["hero"]["file"] = "../outside.png"
+        (self.destination / "assets.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ArtworkError, "来源记录"):
+            artwork.replace_local_asset("cover", source, self.destination)
+
+    def test_local_replacement_rejects_symlink_in_artwork_directory(self):
+        self.make_previous()
+        source = self.root / "chosen.png"
+        source.write_bytes(image_bytes((13, 17)))
+        (self.destination / "outside.png").symlink_to(source)
+        with self.assertRaisesRegex(ArtworkError, "链接"):
+            artwork.replace_local_asset("cover", source, self.destination)
+        self.assertTrue((self.destination / "cover.jpg").is_file())
+
+    @patch("game_manager.artwork.SteamGridDB")
+    def test_worker_gallery_and_single_download_use_new_protocol(self, factory):
+        client = factory.return_value
+        for action, method, value in (
+                ("gallery", "gallery", {"game_id": 42, "kind": "cover", "page": 1}),
+                ("download_one", "download_asset", {"game_id": 42, "kind": "wide", "candidate": candidate()})):
+            with self.subTest(action=action):
+                connection = Mock()
+                function = getattr(client, method)
+                function.return_value = {"done": True}
+                artwork.artwork_worker(connection, "private-test-key", "", action, value, self.destination)
+                connection.send.assert_called_once_with((True, {"done": True}))
+                connection.close.assert_called_once()
+                if action == "gallery":
+                    function.assert_called_once_with(42, "cover", self.destination, 1)
+                else:
+                    function.assert_called_once_with(42, "wide", value["candidate"], self.destination)
 
 
 if __name__ == "__main__":

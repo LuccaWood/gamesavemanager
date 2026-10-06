@@ -77,6 +77,106 @@ class PCGamingWikiTests(unittest.TestCase):
             client.find_save_locations("Hade")
         self.assertEqual(client._session.get.call_count, 2)
 
+    def test_search_returns_choices_with_exact_title_first_and_valid_main_articles_only(self):
+        client = self.client({"query": {"search": [
+            {"ns": 0, "pageid": 12, "title": "Hades II"},
+            {"ns": 0, "pageid": 11, "title": "Hades"},
+            {"ns": 0, "pageid": 12, "title": "Duplicate ID"},
+            {"ns": 0, "pageid": 13, "title": "hades II"},
+            {"ns": 1, "pageid": 14, "title": "Talk:Hades"},
+            {"ns": 0, "pageid": 0, "title": "Invalid ID"},
+            {"ns": 0, "pageid": True, "title": "Boolean ID"},
+            {"ns": 0, "pageid": "15", "title": "Text ID"},
+            {"ns": 0, "pageid": 16, "title": " "},
+            {"ns": 0, "pageid": 17, "title": None},
+            "invalid item",
+        ]}})
+        candidates = client.search_games(" hades ")
+        self.assertEqual([item["title"] for item in candidates], ["Hades", "Hades II"])
+        self.assertEqual(candidates[1]["page_url"], "https://www.pcgamingwiki.com/wiki/Hades_II")
+        params = client._session.get.call_args.kwargs["params"]
+        self.assertEqual(params["action"], "query")
+        self.assertEqual(params["list"], "search")
+        self.assertEqual(params["srsearch"], "hades")
+        self.assertEqual(params["srnamespace"], 0)
+        self.assertEqual(params["srlimit"], 10)
+        self.assertEqual(params["srprop"], "")
+        self.assertEqual(client._session.get.call_count, 1)
+
+    def test_search_limit_empty_and_invalid_responses(self):
+        matches = [{"ns": 0, "pageid": number, "title": f"Game {number}"} for number in range(1, 15)]
+        self.assertEqual(len(self.client({"query": {"search": matches}}).search_games("Game")), 10)
+        self.assertEqual(self.client({"query": {"search": []}}).search_games("Game"), [])
+        for value in ({}, {"query": []}, {"query": {"search": {}}}, {"error": {"info": "secret"}}):
+            with self.subTest(value=value), self.assertRaises(PCGamingWikiError) as caught:
+                self.client(value).search_games("Game")
+            self.assertNotIn("secret", str(caught.exception))
+        with self.assertRaisesRegex(PCGamingWikiError, "英文名"):
+            self.client().search_games(" ")
+
+    def test_selected_page_id_is_parsed_without_search_or_title_fallback(self):
+        client = self.client(self.parsed(title="Renamed Article"))
+        candidates = client.find_save_locations("Original Title", page_id=42)
+        self.assertEqual(candidates[0]["title"], "Renamed Article")
+        params = client._session.get.call_args.kwargs["params"]
+        self.assertEqual(params["pageid"], 42)
+        self.assertNotIn("page", params)
+        for error in ({"code": "missingtitle"}, {"code": "invalidpageid"}):
+            client = self.client({"error": error})
+            with self.subTest(error=error), self.assertRaises(PCGamingWikiError):
+                client.find_save_locations("Old Title", page_id=42)
+            self.assertEqual(client._session.get.call_count, 1)
+        for page_id in (0, -1, True, "42"):
+            client = self.client()
+            with self.subTest(page_id=page_id), self.assertRaises(PCGamingWikiError):
+                client.find_save_locations("Title", page_id=page_id)
+            client._session.get.assert_not_called()
+
+    def test_worker_multiple_matches_waits_for_selection_even_with_exact_match(self):
+        connection = mock.Mock()
+        client = mock.Mock()
+        client.search_games.return_value = [{"pageid": 11, "title": "Hades"}, {"pageid": 12, "title": "Hades II"}]
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client):
+            pcgw_worker(connection, "", "Hades")
+        connection.send.assert_called_once_with((True, {"games": client.search_games.return_value}))
+        client.find_save_locations.assert_not_called()
+        client.close.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_worker_empty_unique_and_selected_matches(self):
+        connection = mock.Mock()
+        client = mock.Mock()
+        client.search_games.return_value = []
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client):
+            pcgw_worker(connection, "", "Hades")
+        connection.send.assert_called_once_with((True, []))
+        client.find_save_locations.assert_not_called()
+        connection.reset_mock()
+        candidate = {"pageid": 12, "title": "Hades II"}
+        client.search_games.return_value = [candidate]
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client):
+            pcgw_worker(connection, "", "Hade")
+        client.find_save_locations.assert_called_once_with("Hades II", page_id=12)
+        connection.send.assert_called_once_with((True, client.find_save_locations.return_value))
+        client.reset_mock()
+        connection.reset_mock()
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client):
+            pcgw_worker(connection, "", candidate)
+        client.search_games.assert_not_called()
+        client.find_save_locations.assert_called_once_with("Hades II", page_id=12)
+        connection.send.assert_called_once_with((True, client.find_save_locations.return_value))
+
+    def test_worker_invalid_selected_candidate_never_falls_back_to_title_search(self):
+        for candidate in ({"title": "Game"}, {"title": "Game", "pageid": "42"}, {"title": "", "pageid": 42}):
+            connection = mock.Mock()
+            client = mock.Mock()
+            with self.subTest(candidate=candidate), mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client):
+                pcgw_worker(connection, "", candidate)
+            self.assertFalse(connection.send.call_args.args[0][0])
+            client.search_games.assert_not_called()
+            client.find_save_locations.assert_not_called()
+            connection.close.assert_called_once()
+
     def test_files_registry_placeholders_and_dangerous_roots(self):
         paths = [r"%APPDATA%\Game\slot.sav", r"%LOCALAPPDATA%\Game\*.sav", r"HKCU\Software\Game",
                  r"<path-to-game>\Saves", "C:\\", r"%USERPROFILE%", r"%USERPROFILE%\Documents",
@@ -156,6 +256,7 @@ class PCGamingWikiTests(unittest.TestCase):
     def test_worker_success_failure_and_cleanup(self):
         connection = mock.Mock()
         client = mock.Mock()
+        client.search_games.return_value = [{"title": "Game", "pageid": 42}]
         client.find_save_locations.return_value = [{"path": "%APPDATA%\\Game", "resolved": True}]
         with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client) as factory:
             pcgw_worker(connection, "http://127.0.0.1:7890", "Game")

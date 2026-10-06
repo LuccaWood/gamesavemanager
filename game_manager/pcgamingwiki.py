@@ -175,21 +175,51 @@ class PCGamingWiki:
                 raise ValueError("响应不是对象")
             return value
         except requests.Timeout:
-            raise PCGamingWikiError("PCGamingWiki 查询超时，请检查网络或 HTTP 代理设置。") from None
+            raise PCGamingWikiError("PCGamingWiki 查询超时，请检查网络或代理设置。") from None
         except ValueError:
             raise PCGamingWikiError("PCGamingWiki 返回了无效数据，无法识别存档目录。") from None
         except requests.RequestException:
-            raise PCGamingWikiError("无法连接 PCGamingWiki，请检查网络或 HTTP 代理设置。") from None
+            raise PCGamingWikiError("无法连接 PCGamingWiki，请检查网络或代理设置。") from None
 
-    def find_save_locations(self, english_name: str) -> list[dict]:
+    def search_games(self, english_name: str) -> list[dict]:
         if not isinstance(english_name, str) or not english_name.strip():
             raise PCGamingWikiError("请先填写游戏英文名。")
         name = english_name.strip()
-        data = self._request(action="parse", page=name, prop="text", redirects=1)
+        data = self._request(action="query", list="search", srsearch=name, srnamespace=0, srlimit=10, srprop="")
+        query = data.get("query")
+        matches = query.get("search") if isinstance(query, dict) else None
+        if not isinstance(matches, list) or "error" in data:
+            raise PCGamingWikiError("PCGamingWiki 返回了无效的文章搜索结果。")
+        candidates, ids, titles = [], set(), set()
+        for item in matches:
+            if not isinstance(item, dict) or type(item.get("ns")) is not int or item["ns"] != 0:
+                continue
+            page_id, title = item.get("pageid"), item.get("title")
+            if type(page_id) is not int or page_id <= 0 or not isinstance(title, str) or not title.strip():
+                continue
+            title = title.strip()
+            if page_id in ids or title.casefold() in titles:
+                continue
+            ids.add(page_id)
+            titles.add(title.casefold())
+            candidates.append({"pageid": page_id, "title": title,
+                               "page_url": "https://www.pcgamingwiki.com/wiki/" + quote(title.replace(" ", "_"), safe="")})
+            if len(candidates) == 10:
+                break
+        return sorted(candidates, key=lambda item: item["title"].casefold() != name.casefold())
+
+    def find_save_locations(self, english_name: str, page_id: int | None = None) -> list[dict]:
+        if not isinstance(english_name, str) or not english_name.strip():
+            raise PCGamingWikiError("请先填写游戏英文名。")
+        if page_id is not None and (type(page_id) is not int or page_id <= 0):
+            raise PCGamingWikiError("请选择有效的 PCGamingWiki 文章。")
+        name = english_name.strip()
+        article = {"page": name} if page_id is None else {"pageid": page_id}
+        data = self._request(action="parse", prop="text", redirects=1, **article)
         error = data.get("error", {})
         if not isinstance(error, dict):
             raise PCGamingWikiError("PCGamingWiki 返回了无效的文章数据。")
-        if error.get("code") == "missingtitle":
+        if page_id is None and error.get("code") == "missingtitle":
             search = self._request(action="query", list="search", srsearch=name, srnamespace=0, srlimit=5)
             query = search.get("query", {})
             matches = query.get("search", []) if isinstance(query, dict) else None
@@ -230,11 +260,25 @@ class PCGamingWiki:
         return sorted(candidates, key=lambda item: not item["resolved"])
 
 
-def pcgw_worker(connection, proxy_url: str, english_name: str) -> None:
+def pcgw_worker(connection, proxy_url: str, value: str | dict) -> None:
     client = None
     try:
         client = PCGamingWiki(proxy_url)
-        connection.send((True, client.find_save_locations(english_name)))
+        if isinstance(value, dict):
+            title, page_id = value.get("title"), value.get("pageid")
+            if not isinstance(title, str) or not title.strip() or type(page_id) is not int or page_id <= 0:
+                raise PCGamingWikiError("请选择有效的 PCGamingWiki 文章。")
+            result = client.find_save_locations(title, page_id=page_id)
+        else:
+            candidates = client.search_games(value)
+            if len(candidates) > 1:
+                result = {"games": candidates}
+            elif candidates:
+                candidate = candidates[0]
+                result = client.find_save_locations(candidate["title"], page_id=candidate["pageid"])
+            else:
+                result = []
+        connection.send((True, result))
     except NetworkError as error:
         connection.send((False, str(error)))
     except Exception:
