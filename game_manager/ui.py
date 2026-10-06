@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from . import configure_tk_runtime
 
 configure_tk_runtime()
@@ -451,6 +452,7 @@ class GameManagerApp(ctk.CTk):
         self.backups = BackupManager(self.storage)
         self.api_key = os.environ.get("STEAMGRIDDB_API_KEY", "") or self.storage.settings.get("api_key", "")
         self.selected_id = self.storage.games[0]["id"] if self.storage.games else None
+        self.checked_game_ids = set()
         self.busy = False
         self.artwork_job = None
         self.save_lookup_queue = []
@@ -460,6 +462,7 @@ class GameManagerApp(ctk.CTk):
         self.action_buttons = []
         self.artwork_controls = []
         self.game_buttons = []
+        self.game_checks = {}
         self.images = []
         self.export_paths = {}
         self.library_export_path = None
@@ -480,17 +483,21 @@ class GameManagerApp(ctk.CTk):
         self.search.bind("<KeyRelease>", lambda _: self.refresh_sidebar())
         self.game_list = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent")
         self.game_list.grid(row=3, column=0, sticky="nsew", padx=8)
+        self.delete_games_button = ctk.CTkButton(self.sidebar, text="删除勾选的游戏（0）", height=36,
+                                                fg_color="#703d4a", hover_color="#8e4b5d",
+                                                command=self.delete_checked_games)
+        self.delete_games_button.grid(row=4, column=0, padx=16, pady=(10, 0), sticky="ew")
         self.add_button = ctk.CTkButton(self.sidebar, text="＋ 添加游戏", height=42, command=self.add_game)
-        self.add_button.grid(row=4, column=0, padx=16, pady=(16, 8), sticky="ew")
+        self.add_button.grid(row=5, column=0, padx=16, pady=(16, 8), sticky="ew")
         self.import_button = ctk.CTkButton(self.sidebar, text="导入游戏数据包", height=38,
                                           fg_color="#303b51", command=self.import_archive)
-        self.import_button.grid(row=5, column=0, padx=16, pady=(0, 8), sticky="ew")
+        self.import_button.grid(row=6, column=0, padx=16, pady=(0, 8), sticky="ew")
         self.library_button = ctk.CTkButton(self.sidebar, text="资料库迁移", height=38,
                                            fg_color="#303b51", command=self.library_transfer)
-        self.library_button.grid(row=6, column=0, padx=16, pady=(0, 8), sticky="ew")
+        self.library_button.grid(row=7, column=0, padx=16, pady=(0, 8), sticky="ew")
         self.settings_button = ctk.CTkButton(self.sidebar, text="软件设置", fg_color="transparent",
                                             border_width=1, command=self.settings)
-        self.settings_button.grid(row=7, column=0, padx=16, pady=(0, 20), sticky="ew")
+        self.settings_button.grid(row=8, column=0, padx=16, pady=(0, 20), sticky="ew")
         self.content = ctk.CTkFrame(self, fg_color="transparent")
         self.content.grid(row=0, column=1, padx=24, pady=(22, 8), sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
@@ -523,7 +530,10 @@ class GameManagerApp(ctk.CTk):
             self.set_status(job["status"])
 
     def selected_game(self):
-        return self.storage.get_game(self.selected_id) if self.selected_id else None
+        try:
+            return self.storage.get_game(self.selected_id) if self.selected_id else None
+        except ValueError:
+            return None
 
     def button(self, parent, text, command, **kwargs):
         kwargs.setdefault("height", 36)
@@ -537,6 +547,8 @@ class GameManagerApp(ctk.CTk):
             widget.destroy()
         self.count_label.configure(text=f"{len(self.storage.games)} 款游戏 · 本地存档仓库")
         self.game_buttons = []
+        self.game_checks = {}
+        self.checked_game_ids.intersection_update(game["id"] for game in self.storage.games)
         query = self.search.get().strip().casefold()
         for game in self.storage.games:
             if query and query not in f"{game['english_name']} {game.get('chinese_name', '')}".casefold():
@@ -544,12 +556,36 @@ class GameManagerApp(ctk.CTk):
             text = game.get("chinese_name") or game["english_name"]
             if game.get("chinese_name"):
                 text += f"\n{game['english_name']}"
-            button = ctk.CTkButton(self.game_list, text=text, anchor="w", height=60,
+            row = ctk.CTkFrame(self.game_list, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            row.grid_columnconfigure(1, weight=1)
+            check = ctk.CTkCheckBox(row, text="", width=22, checkbox_width=18, checkbox_height=18,
+                                   command=lambda gid=game["id"]: self.toggle_game_check(gid))
+            check.grid(row=0, column=0, padx=(0, 6))
+            if game["id"] in self.checked_game_ids:
+                check.select()
+            check.configure(state="disabled" if self.busy or self._closing else "normal")
+            self.game_checks[game["id"]] = check
+            button = ctk.CTkButton(row, text=text, anchor="w", height=60,
                                    fg_color=ACCENT if game["id"] == self.selected_id else "transparent",
                                    hover_color="#2c3750", state="disabled" if self.busy else "normal",
                                    command=lambda gid=game["id"]: self.select(gid))
-            button.pack(fill="x", pady=4)
+            button.grid(row=0, column=1, sticky="ew")
             self.game_buttons.append(button)
+        self.update_delete_games_button()
+
+    def toggle_game_check(self, game_id):
+        if self.busy or self._closing:
+            return
+        if self.game_checks[game_id].get():
+            self.checked_game_ids.add(game_id)
+        else:
+            self.checked_game_ids.discard(game_id)
+        self.update_delete_games_button()
+
+    def update_delete_games_button(self):
+        self.delete_games_button.configure(text=f"删除勾选的游戏（{len(self.checked_game_ids)}）",
+                                           state="disabled" if self.busy or self._closing or not self.checked_game_ids else "normal")
 
     def select(self, game_id):
         if self.busy:
@@ -582,7 +618,7 @@ class GameManagerApp(ctk.CTk):
         ctk.CTkLabel(header, text=game["english_name"], text_color=MUTED, anchor="w").grid(row=1, column=0, sticky="w")
         self.button(header, "编辑资料", lambda: self.open_dialog(GameDialog, game), width=92,
                     fg_color="#303b51").grid(row=0, column=1, padx=6)
-        self.button(header, "删除游戏", self.delete_game, width=92,
+        self.button(header, "删除当前", self.delete_game, width=92,
                     fg_color="#703d4a", hover_color="#8e4b5d").grid(row=0, column=2, padx=6)
         self.render_banner(game)
         paths = ctk.CTkFrame(self.content, fg_color="transparent")
@@ -812,16 +848,101 @@ class GameManagerApp(ctk.CTk):
             self.dialog = dialog_class(self, *args)
 
     def delete_game(self):
+        if self.busy or self._closing:
+            return
         game = self.selected_game()
-        if messagebox.askyesno("删除游戏", f"从列表移除 {game['english_name']}？\n备份和图片会保留在数据目录中。", parent=self):
-            try:
-                self.storage.delete_game(game["id"])
-                if self.artwork_job is not None and self.artwork_job["game"]["id"] == game["id"]:
-                    self.stop_artwork()
+        if game:
+            self.delete_games([game])
+
+    def delete_checked_games(self):
+        if self.busy or self._closing:
+            return
+        games = [dict(game) for game in self.storage.games if game["id"] in self.checked_game_ids]
+        self.delete_games(games)
+
+    def delete_games(self, games):
+        if self.busy or self._closing or not games:
+            return
+        names = "\n".join(f"• {game['english_name']}" for game in games)
+        prompt = (f"删除 {games[0]['english_name']} 及其全部备份和图片？" if len(games) == 1
+                  else f"删除勾选的 {len(games)} 款游戏及其全部备份和图片？\n{names}")
+        if not messagebox.askyesno("删除游戏", prompt + "\n软件内的归档将永久删除，游戏本体和实际存档保留。", parent=self):
+            return
+        ids = {game["id"] for game in games}
+        if self.artwork_job is not None and self.artwork_job["game"]["id"] in ids:
+            self.artwork_job["cancelled_for_deletion"] = True
+            self.stop_artwork()
+        self.save_lookup_queue = [item for item in self.save_lookup_queue if item["game"]["id"] not in ids]
+
+        def work():
+            deleted = []
+            for game in games:
+                try:
+                    self.storage.get_game(game["id"])
+                    self.backups._root(game)
+                    directory = self.storage.game_dir(game)
+                    if directory.exists() and not directory.is_dir():
+                        raise ValueError("游戏数据位置必须是普通文件夹。")
+                except (OSError, ValueError) as exc:
+                    return {"deleted": [], "warning": f"删除前校验失败：{game['english_name']}：{exc}"}
+            for game in games:
+                try:
+                    warning = self.delete_game_data(game)
+                except Exception as exc:
+                    warning = str(exc)
+                if warning:
+                    return {"deleted": deleted, "warning": f"失败游戏：{game['english_name']}\n{warning}"}
+                deleted.append(game["id"])
+            return {"deleted": deleted, "warning": None}
+
+        def complete(result):
+            if self.selected_id not in {item["id"] for item in self.storage.games}:
                 self.selected_id = self.storage.games[0]["id"] if self.storage.games else None
-                self.refresh()
-            except (OSError, ValueError) as exc:
-                self.show_error(exc)
+            self.refresh()
+            if result["warning"]:
+                self.show_error(RuntimeError(f"已删除 {len(result['deleted'])} / 共 {len(games)} 款游戏。\n{result['warning']}"))
+            else:
+                target = games[0]["english_name"] if len(games) == 1 else f"{len(games)} 款游戏"
+                self.set_status(f"已删除 {target} 及其全部备份和图片。")
+        self.run_task("正在删除游戏及全部备份和图片…", work, complete)
+
+    def delete_game_data(self, game):
+        self.backups._root(game)
+        directory = self.storage.game_dir(game)
+        if directory.exists() and not directory.is_dir():
+            raise ValueError("游戏数据位置必须是普通文件夹。")
+        library = {"games": [dict(item) for item in self.storage.games], "settings": dict(self.storage.settings)}
+        temporary = directory.with_name(f".deleting-{uuid.uuid4().hex}") if directory.exists() else None
+        if temporary is not None:
+            directory.rename(temporary)
+        try:
+            self.storage.delete_game(game["id"])
+        except (OSError, ValueError):
+            if temporary is not None:
+                try:
+                    temporary.rename(directory)
+                except OSError as exc:
+                    raise RuntimeError(f"游戏记录删除失败，归档目录恢复未完成；资源保留在 {temporary}，请手动恢复。") from exc
+            raise
+        if temporary is not None:
+            try:
+                shutil.rmtree(temporary)
+            except OSError as exc:
+                location = temporary
+                details = []
+                try:
+                    if temporary.exists():
+                        temporary.rename(directory)
+                        location = directory
+                except OSError as rollback:
+                    details.append(f"目录恢复失败：{rollback}")
+                try:
+                    self.storage.replace_library(library)
+                except (OSError, ValueError) as rollback:
+                    details.append(f"游戏条目恢复失败：{rollback}")
+                return (f"游戏删除未完成：{exc}。部分文件可能已删除，请检查归档。\n"
+                        f"剩余资源位置：{location}" + ("\n" + "；".join(details) if details else "\n游戏条目已保留。"))
+        return None
 
     def show_error(self, error):
         self.set_status("操作失败，请查看提示。")
@@ -1220,7 +1341,7 @@ class GameManagerApp(ctk.CTk):
         self.update_activity()
         try:
             if job["cancelled"]:
-                if not self.busy:
+                if not self.busy and not job.get("cancelled_for_deletion"):
                     self.set_status("存档目录查询已停止。" if job["action"] == "save_lookup"
                                     else "图片获取已停止，原有图片已保留。")
                 return
@@ -1365,9 +1486,10 @@ class GameManagerApp(ctk.CTk):
     def set_busy_widgets(self):
         state = "disabled" if self.busy or self._closing else "normal"
         self.search.configure(state=state)
-        for button in self.action_buttons + self.game_buttons + [self.add_button, self.import_button,
+        for button in self.action_buttons + self.game_buttons + list(self.game_checks.values()) + [self.add_button, self.import_button,
                                                                self.library_button, self.settings_button]:
             button.configure(state=state)
+        self.update_delete_games_button()
         if self.artwork_job is not None and hasattr(self, "artwork_button") and self.artwork_button.winfo_exists():
             self.artwork_button.configure(state="disabled")
         if self.artwork_job is not None:

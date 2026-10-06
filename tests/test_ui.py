@@ -1,9 +1,11 @@
 """真实 Tk 集成测试；需要桌面会话，设置 GAME_MANAGER_GUI_TESTS=1 启用。"""
+import gc
 import json
 import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -153,6 +155,7 @@ def empty_steam_name_worker(connection, proxy_url, app_id):
 class UITests(unittest.TestCase):
     def setUp(self):
         from game_manager.ui import GameManagerApp
+        gc.collect()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.save_dir = self.root / "中文存档 空格"
@@ -172,13 +175,17 @@ class UITests(unittest.TestCase):
         self.app.update()
 
     def tearDown(self):
+        from customtkinter import AppearanceModeTracker
         if getattr(self.app, "artwork_job", None):
             self.app.stop_artwork()
             self.wait_for_artwork()
         self.app.destroy()
+        AppearanceModeTracker.app_list.remove(self.app)
+        self.app = None
         for item in reversed(self.patches):
             item.stop()
         self.temporary.cleanup()
+        gc.collect()
 
     def wait_for_task(self):
         deadline = time.monotonic() + 8
@@ -230,6 +237,11 @@ class UITests(unittest.TestCase):
         (folder / "assets.json").write_text(json.dumps(manifest))
         return folder, {path.name: path.read_bytes() for path in folder.iterdir()}
 
+    def add_archived_game(self, name):
+        game = self.app.storage.save_game({"english_name": name, "save_path": str(self.save_dir)})
+        self.app.backups.create(game)
+        return game
+
     def test_backup_copy_restore_export_and_delete_through_ui(self):
         self.app.create_backup()
         self.wait_for_task()
@@ -262,6 +274,450 @@ class UITests(unittest.TestCase):
         self.app.delete_backup()
         self.wait_for_task()
         self.assertEqual(len(self.app.backup_table.get_children()), 1)
+
+    def test_delete_game_removes_backups_artwork_and_keeps_other_data(self):
+        from game_manager.ui import messagebox
+        body = self.root / "game-body"
+        body.mkdir()
+        (body / "game.exe").write_bytes(b"game")
+        self.game = self.app.storage.save_game({**self.game, "game_path": str(body)})
+        self.app.backups.create(self.game)
+        self.seed_artwork()
+        exported = self.app.backups.export(self.game)
+        export_content = exported.read_bytes()
+        second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
+        self.app.backups.create(second)
+        other = self.app.storage.game_dir(second)
+        original = {path.relative_to(other): path.read_bytes() for path in other.rglob("*") if path.is_file()}
+        directory = self.app.storage.game_dir(self.game)
+        self.app.refresh()
+        self.app.delete_game()
+        self.wait_for_task()
+        with self.assertRaises(ValueError):
+            self.app.storage.get_game(self.game["id"])
+        self.assertFalse(directory.exists())
+        self.assertEqual(self.app.selected_id, second["id"])
+        self.assertEqual({path.relative_to(other): path.read_bytes() for path in other.rglob("*") if path.is_file()}, original)
+        self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
+        self.assertEqual((body / "game.exe").read_bytes(), b"game")
+        self.assertEqual(exported.read_bytes(), export_content)
+        self.assertIn("全部备份和图片", messagebox.askyesno.call_args.args[1])
+
+    def test_multiple_checked_games_delete_their_archives(self):
+        from game_manager.ui import messagebox
+        self.app.backups.create(self.game)
+        self.seed_artwork()
+        exported = self.app.backups.export(self.game)
+        second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
+        third = self.app.storage.save_game({"english_name": "Third Game", "save_path": str(self.save_dir)})
+        for game in (second, third):
+            self.app.backups.create(game)
+        self.app.refresh()
+        self.app.game_checks[self.game["id"]].toggle()
+        self.app.game_checks[second["id"]].toggle()
+        self.assertEqual(self.app.checked_game_ids, {self.game["id"], second["id"]})
+        with patch.object(self.app, "report_callback_exception") as callback_error:
+            self.app.delete_games_button.invoke()
+            self.wait_for_task()
+            callback_error.assert_not_called()
+        self.assertEqual(self.app.storage.games, [third])
+        self.assertFalse(self.app.storage.game_dir(self.game).exists())
+        self.assertFalse(self.app.storage.game_dir(second).exists())
+        self.assertEqual(len(self.app.backups.list_backups(third)), 1)
+        self.assertEqual((self.save_dir / "slot.dat").read_text(), "original")
+        self.assertTrue(exported.is_file())
+        self.assertEqual(self.app.selected_id, third["id"])
+        self.assertEqual(self.app.checked_game_ids, set())
+        self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        messagebox.askyesno.assert_called_once()
+        prompt = messagebox.askyesno.call_args.args[1]
+        self.assertIn("Test Game", prompt)
+        self.assertIn("Second Game", prompt)
+        self.assertNotIn("Third Game", prompt)
+
+    def test_selected_game_is_empty_while_its_batch_deletion_is_pending(self):
+        second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
+        self.app.checked_game_ids = {self.game["id"], second["id"]}
+        entered, release = threading.Event(), threading.Event()
+        delete = self.app.delete_game_data
+
+        def hold_after_delete(game):
+            result = delete(game)
+            if game["id"] == self.game["id"]:
+                entered.set()
+                release.wait(timeout=3)
+            return result
+
+        with patch.object(self.app, "delete_game_data", side_effect=hold_after_delete):
+            self.app.delete_checked_games()
+            try:
+                self.assertTrue(entered.wait(timeout=3))
+                self.assertTrue(self.app.busy)
+                self.assertIsNone(self.app.selected_game())
+            finally:
+                release.set()
+                self.wait_for_task()
+
+    def test_game_checks_survive_filtering_details_switch_and_cancel(self):
+        from game_manager.ui import messagebox
+        self.app.backups.create(self.game)
+        second = self.add_archived_game("Second Game")
+        third = self.add_archived_game("Third Game")
+        self.app.refresh()
+        for game in (self.game, second):
+            self.app.game_checks[game["id"]].toggle()
+        self.app.search.insert(0, "Third")
+        self.app.refresh_sidebar()
+        self.app.select(third["id"])
+        self.assertEqual(set(self.app.game_checks), {third["id"]})
+        self.assertEqual(self.app.checked_game_ids, {self.game["id"], second["id"]})
+        self.assertIn("（2）", self.app.delete_games_button.cget("text"))
+        with patch("game_manager.ui.messagebox.askyesno", return_value=False) as confirm:
+            self.app.delete_checked_games()
+        self.assertEqual(len(self.app.storage.games), 3)
+        for game in (self.game, second, third):
+            self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.assertEqual(self.app.checked_game_ids, {self.game["id"], second["id"]})
+        prompt = confirm.call_args.args[1]
+        self.assertIn("Test Game", prompt)
+        self.assertIn("Second Game", prompt)
+        self.assertNotIn("Third Game", prompt)
+        self.app.search.delete(0, "end")
+        self.app.refresh_sidebar()
+        self.assertEqual(self.app.game_checks[self.game["id"]].get(), 1)
+        self.assertEqual(self.app.game_checks[second["id"]].get(), 1)
+        self.app.game_checks[self.game["id"]].toggle()
+        self.assertEqual(self.app.checked_game_ids, {second["id"]})
+
+    def test_batch_game_delete_validates_all_directories_before_deleting_any(self):
+        from game_manager.ui import messagebox
+        self.app.backups.create(self.game)
+        second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
+        third = self.add_archived_game("Third Game")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep.dat").write_bytes(b"keep")
+        link = self.app.storage.game_dir(second)
+        link.symlink_to(outside, target_is_directory=True)
+        self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
+        self.app.refresh()
+        try:
+            self.app.delete_checked_games()
+            self.wait_for_task()
+            self.assertEqual(len(self.app.storage.games), 3)
+            self.assertEqual(len(self.app.backups.list_backups(self.game)), 1)
+            self.assertEqual(len(self.app.backups.list_backups(third)), 1)
+            self.assertEqual((outside / "keep.dat").read_bytes(), b"keep")
+            self.assertIn("已删除 0 / 共 3", messagebox.showerror.call_args.args[1])
+            self.assertIn("Second Game", messagebox.showerror.call_args.args[1])
+        finally:
+            link.unlink()
+
+    def test_batch_game_delete_configuration_failure_stops_after_first_success(self):
+        from game_manager.ui import messagebox
+        self.app.backups.create(self.game)
+        second = self.add_archived_game("Second Game")
+        third = self.add_archived_game("Third Game")
+        save = self.app.storage._save
+
+        def fail_second(games, settings):
+            if not any(game["id"] == second["id"] for game in games):
+                raise OSError("second configuration failed")
+            return save(games, settings)
+
+        self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
+        self.app.refresh()
+        with patch.object(self.app.storage, "_save", side_effect=fail_second):
+            self.app.delete_checked_games()
+            self.wait_for_task()
+        self.assertEqual(self.app.storage.games, [second, third])
+        self.assertFalse(self.app.storage.game_dir(self.game).exists())
+        for game in (second, third):
+            self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.assertEqual(self.app.checked_game_ids, {second["id"], third["id"]})
+        self.assertEqual(self.app.selected_id, second["id"])
+        self.assertIn("已删除 1 / 共 3", messagebox.showerror.call_args.args[1])
+        self.assertIn("Second Game", messagebox.showerror.call_args.args[1])
+
+    def test_batch_game_delete_cleanup_failure_does_not_restore_previously_deleted_game(self):
+        from game_manager.ui import messagebox, shutil
+        self.app.backups.create(self.game)
+        second = self.add_archived_game("Second Game")
+        third = self.add_archived_game("Third Game")
+        artwork = self.app.storage.artwork_dir(second)
+        artwork.mkdir()
+        (artwork / "logo.png").write_bytes(b"image")
+        remove = shutil.rmtree
+        calls = []
+
+        def fail_second(path, *args, **kwargs):
+            calls.append(path)
+            if len(calls) == 2:
+                (path / "artwork" / "logo.png").unlink()
+                raise PermissionError("second image locked")
+            return remove(path, *args, **kwargs)
+
+        self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
+        self.app.refresh()
+        with patch("game_manager.ui.shutil.rmtree", side_effect=fail_second):
+            self.app.delete_checked_games()
+            self.wait_for_task()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.app.storage.games, [second, third])
+        self.assertFalse(self.app.storage.game_dir(self.game).exists())
+        self.assertFalse((artwork / "logo.png").exists())
+        for game in (second, third):
+            self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.assertEqual(self.app.checked_game_ids, {second["id"], third["id"]})
+        self.assertEqual(self.app.selected_id, second["id"])
+        error = messagebox.showerror.call_args.args[1]
+        self.assertIn("已删除 1 / 共 3", error)
+        self.assertIn("部分文件可能已删除", error)
+        self.assertIn(str(artwork.parent), error)
+
+    @patch("game_manager.ui.artwork_worker", held_artwork_worker)
+    def test_batch_game_delete_stops_artwork_for_any_checked_game(self):
+        second = self.add_archived_game("Second Game")
+        self.app.start_artwork_job("download", second, {"api_key": "test-key", "proxy_url": ""}, 42)
+        job = self.app.artwork_job
+        self.wait_until(lambda: (job["temporary"] / "started").exists())
+        (job["temporary"] / "release").touch()
+        job["process"].join(timeout=3)
+        self.app.checked_game_ids = {self.game["id"], second["id"]}
+        self.app.delete_checked_games()
+        self.assertTrue(job["cancelled"])
+        deadline = time.monotonic() + 3
+        while self.app.results.empty() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.app.results.empty())
+        self.wait_for_task()
+        self.wait_for_artwork()
+        self.assertEqual(self.app.storage.games, [])
+        self.assertFalse(self.app.storage.game_dir(second).exists())
+        self.assertFalse(job["temporary"].exists())
+        self.assertIn("已删除", self.app.status.cget("text"))
+        self.assertNotIn("原有图片已保留", self.app.status.cget("text"))
+
+    @patch("game_manager.ui.artwork_worker", held_artwork_worker)
+    def test_batch_game_delete_keeps_other_game_artwork_task_running(self):
+        second = self.add_archived_game("Second Game")
+        third = self.add_archived_game("Third Game")
+        self.app.start_artwork_job("download", second, {"api_key": "test-key", "proxy_url": ""}, 42)
+        job = self.app.artwork_job
+        self.wait_until(lambda: (job["temporary"] / "started").exists())
+        self.app.checked_game_ids = {self.game["id"], third["id"]}
+        self.app.delete_checked_games()
+        self.wait_for_task()
+        self.assertIs(self.app.artwork_job, job)
+        self.assertFalse(job["cancelled"])
+        self.assertEqual(self.app.storage.games, [second])
+        (job["temporary"] / "release").touch()
+        self.wait_for_artwork()
+        self.assertTrue((self.app.storage.artwork_dir(second) / "hero.png").is_file())
+        self.assertEqual(len(self.app.backups.list_backups(second)), 1)
+
+    def test_batch_game_controls_empty_busy_and_minimum_window_layout(self):
+        with patch("game_manager.ui.messagebox.askyesno") as confirm:
+            self.app.delete_checked_games()
+            confirm.assert_not_called()
+        self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        for index in range(12):
+            self.app.storage.save_game({"english_name": f"Game {index}", "save_path": str(self.save_dir)})
+        self.app.refresh()
+        self.app.deiconify()
+        self.app.geometry("1020x720")
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        button = self.app.delete_games_button
+        self.assertTrue(button.winfo_ismapped())
+        self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), self.app.sidebar.winfo_rooty() + self.app.sidebar.winfo_height())
+        self.app.game_list._parent_canvas.yview_moveto(1)
+        self.app.update()
+        last = self.app.game_checks[self.app.storage.games[-1]["id"]]
+        canvas = self.app.game_list._parent_canvas
+        self.assertGreaterEqual(last.winfo_rooty(), canvas.winfo_rooty())
+        self.assertLessEqual(last.winfo_rooty() + last.winfo_height(), canvas.winfo_rooty() + canvas.winfo_height())
+        self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
+        self.app.refresh()
+        self.app.run_task("等待任务", lambda: time.sleep(0.15), lambda _: None)
+        self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        self.assertTrue(all(check.cget("state") == "disabled" for check in self.app.game_checks.values()))
+        self.app.game_checks[self.game["id"]].toggle()
+        self.assertEqual(len(self.app.checked_game_ids), 13)
+        with patch("game_manager.ui.messagebox.askyesno") as confirm:
+            self.app.delete_checked_games()
+            confirm.assert_not_called()
+        self.wait_for_task()
+        self.app.delete_games_button.invoke()
+        self.wait_for_task()
+        self.assertEqual(self.app.storage.games, [])
+        self.assertEqual(self.app.checked_game_ids, set())
+        self.assertEqual(self.app.game_checks, {})
+        self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+
+    def test_cancelled_game_deletion_keeps_record_and_all_archives(self):
+        self.app.backups.create(self.game)
+        self.seed_artwork()
+        directory = self.app.storage.game_dir(self.game)
+        original = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        with patch("game_manager.ui.messagebox.askyesno", return_value=False):
+            self.app.delete_game()
+        self.assertFalse(self.app.busy)
+        self.assertEqual(self.app.storage.get_game(self.game["id"]), self.game)
+        self.assertEqual({path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}, original)
+
+    def test_deleting_game_without_archives_leaves_empty_library(self):
+        directory = self.app.storage.game_dir(self.game)
+        self.assertFalse(directory.exists())
+        self.app.delete_game()
+        self.wait_for_task()
+        self.assertEqual(self.app.storage.games, [])
+        self.assertIsNone(self.app.selected_id)
+        self.assertFalse(directory.exists())
+        self.assertTrue(self.app.winfo_exists())
+
+    def test_game_delete_configuration_failure_restores_archives(self):
+        from game_manager.ui import messagebox
+        self.app.backups.create(self.game)
+        self.seed_artwork()
+        directory = self.app.storage.game_dir(self.game)
+        original = {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+        library = (self.app.storage.data_dir / "library.json").read_bytes()
+        with patch.object(self.app.storage, "_save", side_effect=OSError("disk full")):
+            self.app.delete_game()
+            self.wait_for_task()
+        self.assertEqual((self.app.storage.data_dir / "library.json").read_bytes(), library)
+        self.assertEqual({path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}, original)
+        self.assertEqual(list(directory.parent.glob(".deleting-*")), [])
+        self.assertIn("disk full", messagebox.showerror.call_args.args[1])
+
+    def test_game_delete_directory_move_failure_keeps_record_and_files(self):
+        from game_manager.ui import messagebox
+        folder, original = self.seed_artwork()
+        with patch.object(Path, "rename", side_effect=PermissionError("locked directory")):
+            self.app.delete_game()
+            self.wait_for_task()
+        self.assertEqual(self.app.storage.get_game(self.game["id"]), self.game)
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        self.assertIn("locked directory", messagebox.showerror.call_args.args[1])
+
+    def test_game_delete_partial_cleanup_failure_keeps_record_and_reports_remaining_files(self):
+        from game_manager.ui import messagebox
+        self.app.backups.create(self.game)
+        folder, original = self.seed_artwork()
+        library = (self.app.storage.data_dir / "library.json").read_bytes()
+
+        def partial_delete(path):
+            (path / "artwork" / "cover.png").unlink()
+            raise PermissionError("locked image")
+
+        with patch("game_manager.ui.shutil.rmtree", side_effect=partial_delete):
+            self.app.delete_game()
+            self.wait_for_task()
+        self.assertEqual((self.app.storage.data_dir / "library.json").read_bytes(), library)
+        self.assertEqual(self.app.selected_id, self.game["id"])
+        self.assertFalse((folder / "cover.png").exists())
+        self.assertEqual((folder / "hero.png").read_bytes(), original["hero.png"])
+        self.assertEqual(len(self.app.backups.list_backups(self.game)), 1)
+        error = messagebox.showerror.call_args.args[1]
+        self.assertIn("部分文件可能已删除", error)
+        self.assertIn(str(self.app.storage.game_dir(self.game)), error)
+        self.assertNotIn("已删除 Test Game", self.app.status.cget("text"))
+        self.assertTrue(self.app.winfo_exists())
+
+    def test_game_delete_metadata_rollback_failure_keeps_ui_running_and_reports_path(self):
+        from game_manager.ui import messagebox
+        folder, original = self.seed_artwork()
+        save = self.app.storage._save
+
+        def fail_restore(games, settings):
+            if any(game["id"] == self.game["id"] for game in games):
+                raise OSError("restore failed")
+            return save(games, settings)
+
+        with patch.object(self.app.storage, "_save", side_effect=fail_restore), \
+                patch("game_manager.ui.shutil.rmtree", side_effect=PermissionError("locked image")):
+            self.app.delete_game()
+            self.wait_for_task()
+        self.assertEqual(self.app.storage.games, [])
+        self.assertIsNone(self.app.selected_id)
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        self.assertIn("游戏条目恢复失败", messagebox.showerror.call_args.args[1])
+        self.assertIn(str(folder.parent), messagebox.showerror.call_args.args[1])
+        self.assertTrue(self.app.winfo_exists())
+
+    def test_game_delete_directory_rollback_failure_reports_preserved_archive_path(self):
+        from game_manager.ui import messagebox
+        self.seed_artwork()
+        directory = self.app.storage.game_dir(self.game)
+        rename = Path.rename
+
+        def fail_restore(path, destination):
+            if path.name.startswith(".deleting-"):
+                raise PermissionError("restore directory locked")
+            return rename(path, destination)
+
+        with patch.object(Path, "rename", fail_restore), \
+                patch("game_manager.ui.shutil.rmtree", side_effect=PermissionError("locked image")):
+            self.app.delete_game()
+            self.wait_for_task()
+        preserved = list(directory.parent.glob(".deleting-*"))
+        self.assertEqual(len(preserved), 1)
+        self.assertTrue((preserved[0] / "artwork" / "hero.png").is_file())
+        self.assertEqual(self.app.storage.get_game(self.game["id"]), self.game)
+        self.assertIn(str(preserved[0]), messagebox.showerror.call_args.args[1])
+        self.assertIn("目录恢复失败", messagebox.showerror.call_args.args[1])
+        self.app.add_game()
+        self.assertTrue(self.app.dialog.winfo_exists())
+
+    def test_game_delete_rejects_linked_game_directory_and_parent(self):
+        from game_manager.ui import messagebox
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "keep.dat").write_bytes(b"keep")
+        directory = self.app.storage.game_dir(self.game)
+        directory.parent.mkdir(parents=True)
+        for link in (directory, directory.parent):
+            with self.subTest(link=link):
+                if link == directory.parent:
+                    link.rmdir()
+                link.symlink_to(outside, target_is_directory=True)
+                try:
+                    self.app.delete_game()
+                    self.wait_for_task()
+                    self.assertEqual(self.app.storage.get_game(self.game["id"]), self.game)
+                    self.assertEqual((outside / "keep.dat").read_bytes(), b"keep")
+                    self.assertIn("不能是链接", messagebox.showerror.call_args.args[1])
+                finally:
+                    link.unlink()
+
+    @patch("game_manager.ui.artwork_worker", held_artwork_worker)
+    def test_deleting_game_stops_completed_artwork_result_without_recreating_directory(self):
+        self.seed_artwork()
+        job = self.start_held_download()
+        (job["temporary"] / "release").touch()
+        job["process"].join(timeout=3)
+        self.assertFalse(job["process"].is_alive())
+        self.app.delete_game()
+        self.assertTrue(job["cancelled"])
+        self.wait_for_task()
+        self.wait_for_artwork()
+        self.assertFalse(self.app.storage.game_dir(self.game).exists())
+        self.assertFalse(job["temporary"].exists())
+        self.assertEqual(self.app.storage.games, [])
+
+    def test_game_delete_is_ignored_while_busy_or_closing(self):
+        self.app.run_task("等待任务", lambda: time.sleep(0.15), lambda _: None)
+        with patch("game_manager.ui.messagebox.askyesno") as confirm:
+            self.app.delete_game()
+            confirm.assert_not_called()
+        self.wait_for_task()
+        with patch.object(self.app, "_closing", True), patch("game_manager.ui.messagebox.askyesno") as confirm:
+            self.app.delete_game()
+            confirm.assert_not_called()
+        self.assertEqual(self.app.storage.get_game(self.game["id"]), self.game)
 
     def test_delete_multiple_selected_backups_with_one_confirmation(self):
         from game_manager.ui import messagebox
