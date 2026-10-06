@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
@@ -42,7 +44,8 @@ def _validate_members(archive: zipfile.ZipFile) -> None:
     for member in archive.infolist():
         name = member.filename
         parts = name.rstrip("/").split("/")
-        if not name or name != member.orig_filename or name.startswith("/") or "\\" in name:
+        if (not name or "\x00" in member.orig_filename or name.startswith("/") or "\\" in name
+                or (archive.mode == "r" and "\\" in member.orig_filename)):
             raise ValueError(f"备份包含不安全的路径：{name!r}")
         for part in parts:
             if (part in ("", ".", "..") or any(ord(char) < 32 or char in '<>:"|?*' for char in part)
@@ -303,3 +306,505 @@ class BackupManager:
                 return destination
             finally:
                 temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _import_header(archive: zipfile.ZipFile) -> tuple[dict, list[str], bool]:
+        _validate_members(archive)
+        groups = {}
+        has_artwork = False
+        for member in archive.infolist():
+            parts = member.filename.rstrip("/").split("/")
+            if parts == ["game.json"] and not member.is_dir():
+                continue
+            if parts[0] == "backups":
+                if len(parts) == 1 and member.is_dir():
+                    continue
+                if len(parts) < 2 or not re.fullmatch(r"[0-9]+_[0-9]{8}_[0-9]{6}", parts[1]):
+                    raise ValueError("导入包包含无效备份目录")
+                files = groups.setdefault(parts[1], set())
+                if len(parts) == 2 and member.is_dir():
+                    continue
+                if len(parts) != 3 or member.is_dir() or parts[2] not in ("metadata.json", "save.zip"):
+                    raise ValueError("导入包的备份结构无效")
+                files.add(parts[2])
+            elif parts[0] == "artwork" and (len(parts) > 1 or member.is_dir()):
+                has_artwork = has_artwork or not member.is_dir()
+            else:
+                raise ValueError(f"导入包包含不支持的项目：{member.filename}")
+        if any(files != {"metadata.json", "save.zip"} for files in groups.values()):
+            raise ValueError("导入包中的备份缺少 metadata.json 或 save.zip")
+        try:
+            value = json.loads(archive.read("game.json"))
+            keys = ("id", "english_name", "chinese_name", "game_path", "save_path", "steamgrid_id")
+            game = {key: value[key] for key in keys}
+            Storage._validate_id(game["id"])
+            if any(not isinstance(game[key], str) for key in keys[1:5]) or not game["english_name"].strip():
+                raise ValueError("游戏名称或目录配置无效")
+            if type(game["steamgrid_id"]) not in (str, int):
+                raise ValueError("SteamGridDB 游戏 ID 无效")
+            game["english_name"] = game["english_name"].strip()
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("导入包的 game.json 缺失或游戏资料无效") from error
+        return game, sorted(groups), has_artwork
+
+    def _import_match(self, game: dict) -> dict | None:
+        by_id = next((item for item in self.storage.games if item["id"] == game["id"]), None)
+        by_name = next((item for item in self.storage.games
+                        if item["english_name"].strip().casefold() == game["english_name"].casefold()), None)
+        if by_id and by_name and by_id["id"] != by_name["id"]:
+            raise ValueError("导入游戏的 ID 和英文名分别对应不同游戏，无法合并")
+        match = by_id or by_name
+        return dict(match) if match else None
+
+    def inspect_import(self, path: Path) -> dict:
+        with self._lock, self.storage._lock:
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    game, backup_ids, has_artwork = self._import_header(archive)
+                return {"game": game, "existing_game": self._import_match(game),
+                        "backup_count": len(backup_ids), "has_artwork": has_artwork}
+            except zipfile.BadZipFile as error:
+                raise ValueError("导入文件不是完整有效的 ZIP 游戏包") from error
+
+    @staticmethod
+    def _local_tree(directory: Path) -> None:
+        if _is_link(directory) or not directory.is_dir():
+            raise ValueError(f"本机游戏资源不是普通目录：{directory}")
+        for parent, directories, files in os.walk(directory, followlinks=False, onerror=_raise_walk_error):
+            for name in directories + files:
+                path = Path(parent) / name
+                if _is_link(path) or not (path.is_dir() or stat.S_ISREG(path.stat().st_mode)):
+                    raise ValueError(f"本机游戏资源包含链接或特殊文件：{path}")
+
+    @staticmethod
+    def _file_hash(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _validated_backup_records(self, source_game: dict, incoming: Path, backup_ids: list[str]) -> list:
+        records, sequences = [], set()
+        for backup_id in backup_ids:
+            directory = incoming / "backups" / backup_id
+            archive_path = directory / "save.zip"
+            try:
+                record = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+                if (record["id"] != backup_id or type(record["sequence"]) is not int or record["sequence"] < 1
+                        or record["sequence"] != int(backup_id.split("_")[0])
+                        or not isinstance(record["reason"], str) or type(record["size"]) is not int
+                        or record["size"] != archive_path.stat().st_size
+                        or not isinstance(record["created_at"], str)
+                        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}",
+                                            record["created_at"])):
+                    raise ValueError("备份元数据无效")
+                created = datetime.fromisoformat(record["created_at"])
+                if created.utcoffset() is None or created.microsecond or backup_id.split("_", 1)[1] != f"{created:%Y%m%d_%H%M%S}":
+                    raise ValueError("备份时间与目录不一致")
+                if record["sequence"] in sequences:
+                    raise ValueError("备份序号重复")
+                sequences.add(record["sequence"])
+                with zipfile.ZipFile(archive_path) as archive:
+                    _validate_members(archive)
+                    if archive.testzip() is not None:
+                        raise ValueError("备份 CRC 校验失败")
+                digest = self._file_hash(archive_path)
+                key = record.get("import_key", f"{source_game['id']}:{backup_id}:{digest}")
+                if (not isinstance(key, str)
+                        or not re.fullmatch(r"[0-9a-f]{32}:[0-9]+_[0-9]{8}_[0-9]{6}:[0-9a-f]{64}", key)
+                        or key.rsplit(":", 1)[1] != digest):
+                    raise ValueError("备份来源标识无效")
+                records.append((record, archive_path, digest, key))
+            except Exception as error:
+                raise ValueError(f"导入备份 {backup_id} 校验失败：{error}") from error
+        return records
+
+    def _import_backups(self, source_game: dict, game: dict, incoming: Path, merged: Path,
+                        backup_ids: list[str]) -> tuple[int, int]:
+        records = self._validated_backup_records(source_game, incoming, backup_ids)
+        sequences = {record["sequence"] for record, _, _, _ in records}
+        local = self.list_backups(game)
+        known = set()
+        for record in local:
+            digest = self._file_hash(self.backup_dir(game, record["id"]) / "save.zip")
+            known.add(f"{game['id']}:{record['id']}:{digest}")
+            key = record.get("import_key")
+            if isinstance(key, str) and key.endswith(":" + digest):
+                known.add(key)
+        counter = merged / "sequence.json"
+        try:
+            next_sequence = json.loads(counter.read_text(encoding="utf-8"))["next_sequence"] if counter.exists() else 1
+            if type(next_sequence) is not int or next_sequence < 1:
+                raise ValueError("序号无效")
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("本机备份序号文件损坏") from error
+        used_ids = {record["id"] for record in local}
+        used_sequences = {record["sequence"] for record in local}
+        next_sequence = max(next_sequence, max(used_sequences | sequences, default=0) + 1)
+        root = merged / "backups"
+        root.mkdir(exist_ok=True)
+        imported = skipped = 0
+        for record, source, digest, key in records:
+            if key in known:
+                skipped += 1
+                continue
+            record = dict(record)
+            if record["id"] in used_ids or record["sequence"] in used_sequences:
+                record["sequence"] = next_sequence
+                created = datetime.fromisoformat(record["created_at"])
+                record["id"] = f"{next_sequence:06d}_{created:%Y%m%d_%H%M%S}"
+                next_sequence += 1
+            record["import_key"] = key
+            directory = root / record["id"]
+            directory.mkdir()
+            shutil.copyfile(source, directory / "save.zip")
+            atomic_write_json(directory / "metadata.json", record)
+            used_ids.add(record["id"])
+            used_sequences.add(record["sequence"])
+            known.add(key)
+            imported += 1
+        atomic_write_json(counter, {"next_sequence": next_sequence})
+        return imported, skipped
+
+    @staticmethod
+    def _artwork_manifest(directory: Path) -> dict | None:
+        path = directory / "assets.json"
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("图片来源必须是对象")
+            assets, missing = value.get("assets", {}), value.get("missing", [])
+            if not isinstance(assets, dict) or not isinstance(missing, list) or any(not isinstance(item, str) for item in missing):
+                raise ValueError("图片来源结构无效")
+            for kind, asset in assets.items():
+                filename = asset["file"]
+                if (not isinstance(kind, str) or not isinstance(filename, str) or filename.startswith("/")
+                        or any(part in ("", ".", "..") for part in filename.split("/"))
+                        or re.search(r'[<>:"|?*\\\x00-\x1f]', filename)
+                        or not directory.joinpath(*filename.split("/")).is_file()):
+                    raise ValueError("图片来源指向无效文件")
+            return value
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"图片来源文件无效：{path}") from error
+
+    def _import_artwork(self, incoming: Path, merged: Path) -> None:
+        source = incoming / "artwork"
+        if not source.exists():
+            return
+        destination = merged / "artwork"
+        local_manifest = self._artwork_manifest(destination)
+        source_manifest = self._artwork_manifest(source)
+        paths = list(source.rglob("*"))
+        local_names = {path.relative_to(destination).as_posix().casefold(): path.relative_to(destination).as_posix()
+                       for path in destination.rglob("*")}
+        for path in paths:
+            relative = path.relative_to(source)
+            name = relative.as_posix()
+            if name.casefold() in local_names and local_names[name.casefold()] != name:
+                raise ValueError(f"导入图片与本机名称大小写冲突：{name}")
+            target = destination / relative
+            if target.exists() and path.is_dir() != target.is_dir():
+                raise ValueError(f"导入图片与本机目录结构冲突：{relative}")
+        replaced = {path.relative_to(source).as_posix().casefold() for path in paths if path.is_file()}
+        shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+        if local_manifest is None and source_manifest is None:
+            return
+        local_assets = (local_manifest or {}).get("assets", {})
+        source_assets = (source_manifest or {}).get("assets", {})
+        assets = {kind: asset for kind, asset in local_assets.items()
+                  if asset["file"].casefold() not in replaced or kind in source_assets}
+        assets.update(source_assets)
+        value = {**(local_manifest or {}), **(source_manifest or {}), "assets": assets}
+        missing = dict.fromkeys((local_manifest or {}).get("missing", []) + (source_manifest or {}).get("missing", []))
+        value["missing"] = [kind for kind in missing if kind not in assets]
+        atomic_write_json(destination / "assets.json", value)
+        self._artwork_manifest(destination)
+
+    def import_game(self, path: Path) -> dict:
+        with self._lock, self.storage._lock:
+            games_root = self.storage.data_dir / "games"
+            if _is_link(games_root):
+                raise ValueError("本机游戏数据目录不能是链接")
+            root_existed = games_root.exists()
+            temporary = previous = destination = None
+            moved = published = False
+            memory = copy.deepcopy((self.storage.games, self.storage.settings))
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    source_game, backup_ids, _ = self._import_header(archive)
+                    game = self._import_match(source_game) or source_game
+                    destination = self.storage.game_dir(game)
+                    self._root(game)
+                    if destination.exists():
+                        self._local_tree(destination)
+                    games_root.mkdir(parents=True, exist_ok=True)
+                    temporary = games_root / f".import-{uuid.uuid4().hex}"
+                    temporary.mkdir()
+                    incoming = temporary / "incoming"
+                    incoming.mkdir()
+                    for member in archive.infolist():
+                        output = incoming.joinpath(*member.filename.rstrip("/").split("/"))
+                        if member.is_dir():
+                            output.mkdir(parents=True, exist_ok=True)
+                        else:
+                            output.parent.mkdir(parents=True, exist_ok=True)
+                            with archive.open(member) as source, output.open("xb") as target:
+                                shutil.copyfileobj(source, target)
+                merged = temporary / "merged"
+                if destination.exists():
+                    shutil.copytree(destination, merged, symlinks=True)
+                    self._local_tree(merged)
+                else:
+                    merged.mkdir()
+                imported, skipped = self._import_backups(source_game, game, incoming, merged, backup_ids)
+                self._import_artwork(incoming, merged)
+                self._local_tree(merged)
+                previous = games_root / f".previous-{uuid.uuid4().hex}"
+                if destination.exists():
+                    destination.rename(previous)
+                    moved = True
+                merged.rename(destination)
+                published = True
+                final_game = self.storage.save_game(game, allow_new_id=True)
+            except Exception as error:
+                self.storage.games, self.storage.settings = memory
+                try:
+                    if published:
+                        destination.rename(temporary / "failed")
+                    if moved:
+                        previous.rename(destination)
+                except OSError as rollback_error:
+                    location = previous if moved else destination
+                    raise RuntimeError(f"导入失败且回滚未完成，保留的游戏资源位于 {location}，请手动恢复。") from rollback_error
+                if isinstance(error, zipfile.BadZipFile):
+                    raise ValueError("导入包或内部备份 ZIP 已损坏，未导入任何内容") from error
+                raise
+            else:
+                result = {"game": final_game, "imported": imported, "skipped": skipped}
+                if moved:
+                    try:
+                        shutil.rmtree(previous)
+                    except OSError:
+                        result["cleanup_warning"] = f"导入成功，但旧资源目录未能清理：{previous}"
+                return result
+            finally:
+                if temporary is not None and temporary.exists():
+                    shutil.rmtree(temporary, ignore_errors=True)
+                if not root_existed and games_root.exists() and not any(games_root.iterdir()):
+                    games_root.rmdir()
+
+    @staticmethod
+    def _library_header(archive: zipfile.ZipFile) -> tuple[dict, dict[str, list[str]]]:
+        _validate_members(archive)
+        resources = {}
+        for member in archive.infolist():
+            parts = member.filename.rstrip("/").split("/")
+            if parts == ["library.json"] and not member.is_dir():
+                continue
+            if parts == ["games"] and member.is_dir():
+                continue
+            if parts[0] != "games" or len(parts) < 2:
+                raise ValueError(f"资料库包包含不支持的项目：{member.filename}")
+            Storage._validate_id(parts[1])
+            groups = resources.setdefault(parts[1], {})
+            if len(parts) == 2 and member.is_dir():
+                continue
+            if len(parts) >= 3 and parts[2] == "artwork" and (len(parts) > 3 or member.is_dir()):
+                continue
+            if len(parts) == 3 and parts[2] == "sequence.json" and not member.is_dir():
+                continue
+            if len(parts) >= 3 and parts[2] == "backups":
+                if len(parts) == 3 and member.is_dir():
+                    continue
+                if len(parts) < 4 or not re.fullmatch(r"[0-9]+_[0-9]{8}_[0-9]{6}", parts[3]):
+                    raise ValueError("资料库包包含无效备份目录")
+                files = groups.setdefault(parts[3], set())
+                if len(parts) == 4 and member.is_dir():
+                    continue
+                if len(parts) == 5 and not member.is_dir() and parts[4] in ("metadata.json", "save.zip"):
+                    files.add(parts[4])
+                    continue
+            raise ValueError(f"资料库包的游戏资源结构无效：{member.filename}")
+        if any(files != {"metadata.json", "save.zip"} for groups in resources.values() for files in groups.values()):
+            raise ValueError("资料库包中的备份缺少 metadata.json 或 save.zip")
+        try:
+            games, settings = Storage.validate_library(json.loads(archive.read("library.json")))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("资料库包的 library.json 缺失或资料无效") from error
+        return {"games": games, "settings": settings}, {key: sorted(groups) for key, groups in resources.items()}
+
+    def _library_routes(self, library: dict, resources: dict) -> tuple[dict, list[dict], int]:
+        games = copy.deepcopy(self.storage.games)
+        routes, destinations = {}, set()
+        existing = 0
+        for source in library["games"]:
+            match = self._import_match({**source, "english_name": source["english_name"].strip()})
+            target = match or source
+            if target["id"] in destinations:
+                raise ValueError("资料库中的多个游戏资源对应同一本机游戏，无法合并")
+            routes[source["id"]] = target["id"]
+            destinations.add(target["id"])
+            if match:
+                existing += 1
+            else:
+                games.append(copy.deepcopy(source))
+        for game_id in resources:
+            if game_id not in routes:
+                if game_id in destinations:
+                    raise ValueError("资料库中的孤留资源与游戏合并目标冲突")
+                routes[game_id] = game_id
+                destinations.add(game_id)
+        return routes, games, existing
+
+    @staticmethod
+    def _library_counter(directory: Path) -> int:
+        path = directory / "sequence.json"
+        if not path.exists():
+            return 1
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))["next_sequence"]
+            if _is_link(path) or type(value) is not int or value < 1:
+                raise ValueError("序号无效")
+            return value
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"资料库备份序号文件损坏：{path}") from error
+
+    def inspect_library(self, path: Path) -> dict:
+        with self._lock, self.storage._lock:
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    library, resources = self._library_header(archive)
+                _, _, existing = self._library_routes(library, resources)
+                ids = {game["id"] for game in library["games"]}
+                return {"game_count": len(ids), "backup_count": sum(map(len, resources.values())),
+                        "existing_count": existing, "new_count": len(ids) - existing,
+                        "orphan_count": len(set(resources) - ids), "settings_count": len(library["settings"])}
+            except zipfile.BadZipFile as error:
+                raise ValueError("导入文件不是完整有效的 ZIP 资料库包") from error
+
+    def export_library(self) -> Path:
+        with self._lock, self.storage._lock:
+            games, settings = Storage.validate_library({"games": self.storage.games, "settings": self.storage.settings})
+            root = self.storage.data_dir / "games"
+            if root.exists() or _is_link(root):
+                self._local_tree(root)
+            exports = self.storage.data_dir / "exports"
+            if _is_link(exports):
+                raise ValueError("导出目录不能是链接")
+            exports.mkdir(parents=True, exist_ok=True)
+            now = datetime.now().astimezone()
+            destination = exports / f"Library_{now:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.zip"
+            temporary = exports / f".tmp-{uuid.uuid4().hex}"
+            try:
+                with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr("library.json", json.dumps({"games": games, "settings": settings}, ensure_ascii=False, indent=2))
+                    if root.exists():
+                        for directory in sorted(root.iterdir()):
+                            if directory.name.startswith("."):
+                                continue
+                            Storage._validate_id(directory.name)
+                            if not directory.is_dir():
+                                raise ValueError("游戏资源必须是目录")
+                            archive.write(directory, f"games/{directory.name}")
+                            for parent, directories, files in os.walk(directory, followlinks=False, onerror=_raise_walk_error):
+                                if Path(parent) == directory / "backups":
+                                    directories[:] = [name for name in directories if not name.startswith(".")]
+                                for name in sorted(directories + files):
+                                    path = Path(parent) / name
+                                    archive.write(path, f"games/{path.relative_to(root).as_posix()}")
+                with zipfile.ZipFile(temporary) as archive:
+                    _, resources = self._library_header(archive)
+                for game_id, backup_ids in resources.items():
+                    directory = root / game_id
+                    self._library_counter(directory)
+                    self._validated_backup_records({"id": game_id}, directory, backup_ids)
+                    self._artwork_manifest(directory / "artwork")
+                temporary.rename(destination)
+                return destination
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def import_library(self, path: Path) -> dict:
+        with self._lock, self.storage._lock:
+            root = self.storage.data_dir / "games"
+            if root.exists() or _is_link(root):
+                self._local_tree(root)
+            memory = copy.deepcopy((self.storage.games, self.storage.settings))
+            temporary = previous = None
+            moved = published = False
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    library, resources = self._library_header(archive)
+                    routes, games, existing = self._library_routes(library, resources)
+                    if archive.testzip() is not None:
+                        raise ValueError("资料库包 CRC 校验失败，未导入任何内容")
+                    temporary = self.storage.data_dir / f".library-import-{uuid.uuid4().hex}"
+                    incoming = temporary / "incoming"
+                    incoming.mkdir(parents=True)
+                    for member in archive.infolist():
+                        output = incoming.joinpath(*member.filename.rstrip("/").split("/"))
+                        if member.is_dir():
+                            output.mkdir(parents=True, exist_ok=True)
+                        else:
+                            output.parent.mkdir(parents=True, exist_ok=True)
+                            with archive.open(member) as source, output.open("xb") as target:
+                                shutil.copyfileobj(source, target)
+                staged = Storage(temporary / "merged")
+                staged.replace_library({"games": games, "settings": {**self.storage.settings, **library["settings"]}})
+                staged_root = staged.data_dir / "games"
+                if root.exists():
+                    shutil.copytree(root, staged_root, symlinks=True)
+                    self._local_tree(staged_root)
+                else:
+                    staged_root.mkdir()
+                manager = BackupManager(staged)
+                imported = skipped = 0
+                for source_id, backup_ids in resources.items():
+                    source = incoming / "games" / source_id
+                    game = {"id": routes[source_id]}
+                    merged = staged.game_dir(game)
+                    merged.mkdir(exist_ok=True)
+                    counter = max(self._library_counter(source), self._library_counter(merged))
+                    atomic_write_json(merged / "sequence.json", {"next_sequence": counter})
+                    added, ignored = manager._import_backups({"id": source_id}, game, source, merged, backup_ids)
+                    imported += added
+                    skipped += ignored
+                    manager._import_artwork(source, merged)
+                self._local_tree(staged_root)
+                previous = self.storage.data_dir / f".library-previous-{uuid.uuid4().hex}"
+                if root.exists():
+                    root.rename(previous)
+                    moved = True
+                staged_root.rename(root)
+                published = True
+                self.storage.replace_library({"games": staged.games, "settings": staged.settings})
+            except Exception as error:
+                self.storage.games, self.storage.settings = memory
+                try:
+                    if published:
+                        root.rename(temporary / "failed")
+                    if moved:
+                        previous.rename(root)
+                except OSError as rollback_error:
+                    location = previous if moved else root
+                    raise RuntimeError(f"资料库导入失败且回滚未完成，保留的原游戏资源位于 {location}，请手动恢复。") from rollback_error
+                if isinstance(error, zipfile.BadZipFile):
+                    raise ValueError("资料库包或内部备份 ZIP 已损坏，未导入任何内容") from error
+                raise
+            else:
+                source_ids = {game["id"] for game in library["games"]}
+                result = {"new_games": len(source_ids) - existing, "merged_games": existing,
+                          "imported": imported, "skipped": skipped, "orphan_count": len(set(resources) - source_ids),
+                          "settings_keys": list(library["settings"])}
+                if moved:
+                    try:
+                        shutil.rmtree(previous)
+                    except OSError:
+                        result["cleanup_warning"] = f"导入成功，但原资料库资源目录未能清理：{previous}"
+                return result
+            finally:
+                if temporary is not None and temporary.exists():
+                    shutil.rmtree(temporary, ignore_errors=True)

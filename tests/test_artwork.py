@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import requests
 from PIL import Image
 
+from game_manager import artwork
 from game_manager.artwork import ArtworkError, SteamGridDB
 
 
@@ -37,6 +38,25 @@ def candidate(asset_id=123, name="作者"):
     return {"id": asset_id, "url": f"https://cdn2.steamgriddb.com/grid/{asset_id}.png", "author": {"name": name, "steam64": "100"}}
 
 
+class CaptureAdapter(requests.adapters.BaseAdapter):
+    def __init__(self):
+        self.calls = []
+
+    def send(self, request, **kwargs):
+        self.calls.append((request, kwargs))
+        response = requests.Response()
+        response.status_code = 200
+        response.url = request.url
+        response.request = request
+        response._content_consumed = True
+        response._content = (json.dumps({"success": True, "data": [{"id": 42, "name": "Game"}]}).encode()
+                             if request.url.startswith(SteamGridDB.BASE_URL) else image_bytes())
+        return response
+
+    def close(self):
+        pass
+
+
 class SteamGridDBTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -45,6 +65,7 @@ class SteamGridDBTests(unittest.TestCase):
         self.client = SteamGridDB("private-test-key")
 
     def tearDown(self):
+        self.client.close()
         self.temporary.cleanup()
 
     def make_previous(self):
@@ -57,7 +78,7 @@ class SteamGridDBTests(unittest.TestCase):
         self.assertEqual((self.destination / "assets.json").read_text(encoding="utf-8"), '{"previous": true}')
         self.assertEqual(set(self.root.iterdir()), {self.destination})
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_search_encodes_name_and_returns_game_fields(self, get):
         get.return_value = api_response([{"id": 42, "name": "Game + / Test", "release_date": 100}])
         self.assertEqual(self.client.search("  Game + / Test  "), [{"id": 42, "name": "Game + / Test", "release_date": 100}])
@@ -67,7 +88,7 @@ class SteamGridDBTests(unittest.TestCase):
         self.assertFalse(get.call_args.kwargs["allow_redirects"])
         get.return_value.close.assert_called_once()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_downloads_valid_assets_and_persists_manifest_without_key(self, get):
         sizes = [(600, 900), (920, 430), (1920, 620), (300, 120)]
         responses = []
@@ -100,7 +121,7 @@ class SteamGridDBTests(unittest.TestCase):
             self.assertTrue((self.destination / record["file"]).is_file())
         self.assertEqual(set(self.root.iterdir()), {self.destination})
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_empty_results_are_recorded_as_missing(self, get):
         get.side_effect = [api_response([]) for _ in range(4)]
         manifest = self.client.download_assets(42, self.destination)
@@ -108,7 +129,7 @@ class SteamGridDBTests(unittest.TestCase):
         self.assertEqual(manifest["missing"], ["cover", "wide", "hero", "logo"])
         self.assertEqual(get.call_count, 4)
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_chooses_first_candidate_with_required_metadata_dimensions(self, get):
         incorrect = candidate(1)
         incorrect.update({"width": 460, "height": 215})
@@ -119,13 +140,13 @@ class SteamGridDBTests(unittest.TestCase):
         self.assertEqual(manifest["assets"]["cover"]["id"], 2)
         self.assertEqual(get.call_args_list[1].args[0], correct["url"])
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_missing_key_does_not_make_request(self, get):
         with self.assertRaisesRegex(ArtworkError, "API Key"):
             SteamGridDB("").search("Game")
         get.assert_not_called()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_authorization_rate_limit_and_timeout_have_safe_errors(self, get):
         for status, expected in [(401, "缺失或无效"), (429, "过于频繁"), (404, "未找到")]:
             with self.subTest(status=status):
@@ -139,7 +160,7 @@ class SteamGridDBTests(unittest.TestCase):
         self.assertNotIn("private-test-key", str(raised.exception))
         self.assertNotIn("private-test-key", "".join(traceback.format_exception(type(raised.exception), raised.exception, raised.exception.__traceback__)))
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_failed_later_request_preserves_old_images(self, get):
         self.make_previous()
         get.side_effect = [api_response([candidate()]), image_response(image_bytes()), requests.ConnectionError("private-test-key")]
@@ -147,7 +168,7 @@ class SteamGridDBTests(unittest.TestCase):
             self.client.download_assets(42, self.destination)
         self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_wrong_dimensions_and_damaged_images_preserve_previous_data(self, get):
         self.make_previous()
         for content, expected in [(image_bytes((600, 899)), "尺寸不正确"), (b"not a valid image", "已损坏")]:
@@ -157,7 +178,7 @@ class SteamGridDBTests(unittest.TestCase):
                     self.client.download_assets(42, self.destination)
                 self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_size_limit_applies_to_header_and_stream(self, get):
         self.make_previous()
         self.client.MAX_IMAGE_BYTES = 10
@@ -168,7 +189,7 @@ class SteamGridDBTests(unittest.TestCase):
                     self.client.download_assets(42, self.destination)
                 self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_rejects_untrusted_urls_before_download(self, get):
         self.make_previous()
         for url in ["http://cdn2.steamgriddb.com/a.png", "https://steamgriddb.com.evil.test/a.png", "https://evil.test/a.png", "https://cdn2.steamgriddb.com/a.png?key=private-test-key"]:
@@ -181,7 +202,7 @@ class SteamGridDBTests(unittest.TestCase):
                 self.assert_previous_unchanged()
         self.assertEqual(get.call_count, 4)
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_redirects_and_unsupported_formats_fail(self, get):
         self.make_previous()
         redirect = image_response(b"")
@@ -193,14 +214,14 @@ class SteamGridDBTests(unittest.TestCase):
                     self.client.download_assets(42, self.destination)
                 self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_manifest_redacts_key_if_server_repeats_it_in_author(self, get):
         get.side_effect = [api_response([candidate(name="private-test-key")]), image_response(image_bytes()), api_response([]), api_response([]), api_response([])]
         manifest = self.client.download_assets(42, self.destination)
         self.assertNotIn("private-test-key", json.dumps(manifest))
         self.assertEqual(manifest["assets"]["cover"]["author"]["name"], "[已隐藏]")
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_jpeg_cover_is_supported_but_jpeg_logo_is_rejected(self, get):
         self.make_previous()
         get.side_effect = [
@@ -212,7 +233,7 @@ class SteamGridDBTests(unittest.TestCase):
         self.assertEqual(get.call_count, 6)
         self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_animated_png_is_rejected(self, get):
         self.make_previous()
         content = io.BytesIO()
@@ -225,7 +246,7 @@ class SteamGridDBTests(unittest.TestCase):
             self.client.download_assets(42, self.destination)
         self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_publish_failure_rolls_back_previous_directory(self, get):
         self.make_previous()
         get.side_effect = [api_response([]) for _ in range(4)]
@@ -241,11 +262,136 @@ class SteamGridDBTests(unittest.TestCase):
                 self.client.download_assets(42, self.destination)
         self.assert_previous_unchanged()
 
-    @patch("game_manager.artwork.requests.get")
+    @patch("game_manager.artwork.requests.Session.get")
     def test_malformed_api_data_is_rejected(self, get):
         get.return_value = api_response(None)
         with self.assertRaisesRegex(ArtworkError, "格式不正确"):
             self.client.search("Game")
+
+
+class ProxyAndArtworkWorkerTests(unittest.TestCase):
+    def test_explicit_proxy_and_direct_mode_ignore_environment_and_system(self):
+        environment = {"HTTP_PROXY": "http://environment.invalid:11", "HTTPS_PROXY": "http://environment.invalid:12",
+                       "ALL_PROXY": "http://environment.invalid:13", "NO_PROXY": "*"}
+        with tempfile.TemporaryDirectory() as directory:
+            for proxy_url in ("", "http://127.0.0.1:7890"):
+                with self.subTest(proxy_url=proxy_url):
+                    client = SteamGridDB("private-test-key", proxy_url=proxy_url)
+                    staging = Path(directory) / ("proxy" if proxy_url else "direct")
+                    staging.mkdir()
+                    adapter = CaptureAdapter()
+                    client._session.mount("https://", adapter)
+                    try:
+                        with patch.dict("os.environ", environment), \
+                                patch("requests.sessions.get_environ_proxies", side_effect=AssertionError("读取了环境/系统代理")), \
+                                patch("requests.sessions.get_netrc_auth", side_effect=AssertionError("读取了系统认证")):
+                            self.assertEqual(client.search("Game"), [{"id": 42, "name": "Game", "release_date": None}])
+                            client._download("https://cdn2.steamgriddb.com/grid/1.png", staging, "cover", (600, 900))
+                        expected = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+                        self.assertEqual(len(adapter.calls), 2)
+                        for request, options in adapter.calls:
+                            self.assertEqual(options["proxies"], expected)
+                            self.assertTrue(options["verify"])
+                        self.assertEqual(adapter.calls[0][0].headers["Authorization"], "Bearer private-test-key")
+                        self.assertNotIn("Authorization", adapter.calls[1][0].headers)
+                    finally:
+                        client.close()
+
+    def test_proxy_validation_normalizes_and_rejects_without_revealing_credentials(self):
+        self.assertEqual(SteamGridDB.validate_proxy_url(""), "")
+        self.assertEqual(SteamGridDB.validate_proxy_url(" HTTP://ProxyUsernameSecret:Secret@localhost:7890 "),
+                         "http://ProxyUsernameSecret:Secret@localhost:7890")
+        for value in ("localhost:7890", "https://ProxyUsernameSecret:Secret@localhost:7890", "socks5://localhost:7890",
+                      "http://localhost", "http://localhost:0", "http://localhost:65536",
+                      "http://localhost:abc", "http://localhost:7890/path", "http://localhost:7890?password=Secret",
+                      "http://localhost:7890#Secret", "http://:7890", "http://local\nhost:7890"):
+            with self.subTest(value=value):
+                try:
+                    SteamGridDB.validate_proxy_url(value)
+                except ArtworkError as error:
+                    details = "".join(traceback.format_exception(error))
+                    self.assertNotIn("Secret", details)
+                    self.assertNotIn(value, str(error))
+                else:
+                    self.fail("无效代理地址未被拒绝")
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_proxy_request_errors_hide_key_and_password(self, get):
+        client = SteamGridDB("private-test-key", proxy_url="http://ProxyUsernameSecret:Secret@localhost:7890")
+        try:
+            for exception in (requests.exceptions.ProxyError, requests.Timeout, requests.ConnectionError):
+                for action in ("api", "image"):
+                    with self.subTest(exception=exception, action=action):
+                        get.side_effect = exception("private-test-key http://ProxyUsernameSecret:Secret@localhost:7890")
+                        try:
+                            if action == "api":
+                                client.search("Game")
+                            else:
+                                with tempfile.TemporaryDirectory() as directory:
+                                    client._download("https://cdn2.steamgriddb.com/grid/1.png", Path(directory), "cover", (600, 900))
+                        except ArtworkError as error:
+                            details = "".join(traceback.format_exception(error))
+                            self.assertNotIn("private-test-key", details)
+                            self.assertNotIn("Secret", details)
+                            self.assertNotIn("ProxyUsernameSecret", details)
+                        else:
+                            self.fail("请求失败未被转换为安全错误")
+        finally:
+            client.close()
+
+    @patch("game_manager.artwork.SteamGridDB")
+    def test_worker_search_and_download_send_results_and_close(self, factory):
+        client = factory.return_value
+        client.search.return_value = [{"id": 42, "name": "Game"}]
+        client.download_assets.return_value = {"assets": {}, "missing": []}
+        for action, value, destination, result in (
+                ("search", "Game", None, client.search.return_value),
+                ("download", 42, Path("staging/artwork"), client.download_assets.return_value)):
+            with self.subTest(action=action):
+                client.reset_mock()
+                connection = Mock()
+                artwork.artwork_worker(connection, "private-test-key", "http://localhost:7890", action, value, destination)
+                factory.assert_called_with("private-test-key", "http://localhost:7890")
+                connection.send.assert_called_once_with((True, result))
+                connection.close.assert_called_once()
+                client.close.assert_called_once()
+                if action == "search":
+                    client.search.assert_called_once_with(value)
+                    client.download_assets.assert_not_called()
+                else:
+                    client.download_assets.assert_called_once_with(value, destination)
+                    client.search.assert_not_called()
+
+    @patch("game_manager.artwork.SteamGridDB")
+    def test_worker_safe_and_unknown_errors_close_connection(self, factory):
+        client = factory.return_value
+        for error, expected in ((ArtworkError("安全错误"), "安全错误"),
+                                (RuntimeError("private-test-key Secret"), "图片后台任务失败，请重试。")):
+            with self.subTest(error=type(error)):
+                client.reset_mock()
+                client.search.side_effect = error
+                connection = Mock()
+                artwork.artwork_worker(connection, "private-test-key", "", "search", "Game")
+                connection.send.assert_called_once_with((False, expected))
+                client.close.assert_called_once()
+                connection.close.assert_called_once()
+
+    @patch("game_manager.artwork.requests.Session.get")
+    def test_worker_download_only_writes_given_staging_directory(self, get):
+        get.side_effect = [api_response([]) for _ in range(4)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            official = root / "artwork"
+            official.mkdir()
+            (official / "cover.png").write_bytes(b"previous cover")
+            staging = root / "worker" / "artwork"
+            connection = Mock()
+            artwork.artwork_worker(connection, "private-test-key", "", "download", 42, staging)
+            self.assertEqual(connection.send.call_args.args[0][0], True)
+            self.assertEqual((official / "cover.png").read_bytes(), b"previous cover")
+            self.assertTrue((staging / "assets.json").is_file())
+            self.assertFalse((root / "library.json").exists())
+            connection.close.assert_called_once()
 
 
 if __name__ == "__main__":

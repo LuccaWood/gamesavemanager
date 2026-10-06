@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -35,31 +36,35 @@ class Storage:
         if self._path.exists():
             try:
                 value = json.loads(self._path.read_text(encoding="utf-8"))
-                if not isinstance(value, dict):
-                    raise ValueError("数据必须是对象")
-                games, settings = value["games"], value["settings"]
-                if not isinstance(games, list) or not isinstance(settings, dict):
-                    raise ValueError("games/settings 类型错误")
-                ids, names = set(), set()
-                for game in games:
-                    if not isinstance(game, dict):
-                        raise ValueError("游戏条目必须是对象")
-                    self._validate_id(game["id"])
-                    name = game["english_name"]
-                    if not isinstance(name, str) or not name.strip():
-                        raise ValueError("游戏英文名不能为空")
-                    for key in ("chinese_name", "game_path", "save_path"):
-                        if not isinstance(game[key], str):
-                            raise ValueError(f"{key} 必须是文本")
-                    if not isinstance(game["steamgrid_id"], (str, int)):
-                        raise ValueError("steamgrid_id 类型错误")
-                    if game["id"] in ids or name.strip().casefold() in names:
-                        raise ValueError("存在重复游戏条目")
-                    ids.add(game["id"])
-                    names.add(name.strip().casefold())
-                self.games, self.settings = games, settings
+                self.games, self.settings = self.validate_library(value)
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(f"数据文件损坏：{self._path}。请保留文件并恢复备份。") from error
+
+    @staticmethod
+    def validate_library(value) -> tuple[list[dict], dict]:
+        if not isinstance(value, dict):
+            raise ValueError("数据必须是对象")
+        games, settings = value["games"], value["settings"]
+        if not isinstance(games, list) or not isinstance(settings, dict):
+            raise ValueError("games/settings 类型错误")
+        ids, names = set(), set()
+        for game in games:
+            if not isinstance(game, dict):
+                raise ValueError("游戏条目必须是对象")
+            Storage._validate_id(game["id"])
+            name = game["english_name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("游戏英文名不能为空")
+            for key in ("chinese_name", "game_path", "save_path"):
+                if not isinstance(game[key], str):
+                    raise ValueError(f"{key} 必须是文本")
+            if not isinstance(game["steamgrid_id"], (str, int)):
+                raise ValueError("steamgrid_id 类型错误")
+            if game["id"] in ids or name.strip().casefold() in names:
+                raise ValueError("存在重复游戏条目")
+            ids.add(game["id"])
+            names.add(name.strip().casefold())
+        return copy.deepcopy(games), copy.deepcopy(settings)
 
     @staticmethod
     def _validate_id(game_id: str) -> None:
@@ -75,6 +80,11 @@ class Storage:
         atomic_write_json(self._path, {"games": games, "settings": settings})
         self.games, self.settings = games, settings
 
+    def replace_library(self, value: dict) -> None:
+        with self._lock:
+            games, settings = self.validate_library(value)
+            self._save(games, settings)
+
     def get_game(self, game_id: str) -> dict:
         with self._lock:
             for game in self.games:
@@ -82,7 +92,7 @@ class Storage:
                     return dict(game)
         raise ValueError("游戏条目不存在")
 
-    def save_game(self, values: dict) -> dict:
+    def save_game(self, values: dict, *, allow_new_id: bool = False) -> dict:
         with self._lock:
             name = values.get("english_name", "")
             if not isinstance(name, str) or not name.strip():
@@ -90,7 +100,13 @@ class Storage:
             name = name.strip()
             game_id = values.get("id") or uuid.uuid4().hex
             self._validate_id(game_id)
-            existing = self.get_game(game_id) if values.get("id") else {}
+            existing = {}
+            if values.get("id"):
+                try:
+                    existing = self.get_game(game_id)
+                except ValueError:
+                    if not allow_new_id:
+                        raise
             if any(game["id"] != game_id and game["english_name"].strip().casefold() == name.casefold()
                    for game in self.games):
                 raise ValueError("已存在同名游戏（英文名不区分大小写）")

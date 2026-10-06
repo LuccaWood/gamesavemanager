@@ -25,8 +25,34 @@ class SteamGridDB:
     MAX_IMAGE_PIXELS = 40_000_000
     USER_AGENT = "GameSaveManager/1.0"
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, proxy_url: str = ""):
         self._api_key = api_key.strip()
+        proxy_url = self.validate_proxy_url(proxy_url)
+        self._session = requests.Session()
+        self._session.trust_env = False
+        self._session.proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+
+    @staticmethod
+    def validate_proxy_url(value: str) -> str:
+        try:
+            if not isinstance(value, str):
+                raise ValueError("代理地址必须是文本")
+            value = value.strip()
+            if not value:
+                return ""
+            if any(character.isspace() or ord(character) < 32 for character in value):
+                raise ValueError("代理地址包含空白")
+            parsed = urlsplit(value)
+            if (parsed.scheme != "http" or not parsed.hostname or parsed.port is None
+                    or not 1 <= parsed.port <= 65535 or parsed.path or parsed.query or parsed.fragment
+                    or parsed.netloc.count("@") > 1 or (parsed.password is not None and not parsed.username)):
+                raise ValueError("代理地址结构无效")
+            return f"http://{parsed.netloc}"
+        except (TypeError, ValueError):
+            raise ArtworkError("HTTP 代理地址无效，请使用 http://主机:端口 格式。") from None
+
+    def close(self) -> None:
+        self._session.close()
 
     def search(self, english_name: str) -> list[dict]:
         name = english_name.strip()
@@ -115,7 +141,7 @@ class SteamGridDB:
             raise ArtworkError("请先在设置中填写 SteamGridDB API Key。")
         response = None
         try:
-            response = requests.get(
+            response = self._session.get(
                 self.BASE_URL + endpoint,
                 headers={"Authorization": f"Bearer {self._api_key}", "User-Agent": self.USER_AGENT},
                 params=params, timeout=self.TIMEOUT, allow_redirects=False,
@@ -133,6 +159,8 @@ class SteamGridDB:
             return data
         except requests.Timeout:
             raise ArtworkError("连接 SteamGridDB 超时，请检查网络后重试。") from None
+        except requests.exceptions.ProxyError:
+            raise ArtworkError("无法连接 HTTP 代理，请检查地址和代理服务。") from None
         except requests.RequestException:
             raise ArtworkError("无法连接 SteamGridDB，请检查网络后重试。") from None
         finally:
@@ -143,7 +171,7 @@ class SteamGridDB:
         response = None
         temporary = staging / f".{kind}.download"
         try:
-            response = requests.get(
+            response = self._session.get(
                 url, headers={"User-Agent": self.USER_AGENT}, stream=True,
                 timeout=self.TIMEOUT, allow_redirects=False,
             )
@@ -189,6 +217,8 @@ class SteamGridDB:
             return filename, width, height
         except requests.Timeout:
             raise ArtworkError("图片下载超时，请检查网络后重试。") from None
+        except requests.exceptions.ProxyError:
+            raise ArtworkError("无法连接 HTTP 代理，请检查地址和代理服务。") from None
         except requests.RequestException:
             raise ArtworkError("图片下载失败，请检查网络后重试。") from None
         finally:
@@ -242,3 +272,30 @@ class SteamGridDB:
             raise
         if had_previous:
             shutil.rmtree(previous, ignore_errors=True)
+
+
+def artwork_worker(connection, api_key, proxy_url, action, value, destination=None) -> None:
+    client = None
+    try:
+        try:
+            client = SteamGridDB(api_key, proxy_url)
+            if action == "search":
+                result = client.search(value)
+            elif action == "download":
+                if destination is None:
+                    raise ArtworkError("图片后台任务缺少目标目录。")
+                result = client.download_assets(value, Path(destination))
+            else:
+                raise ArtworkError("图片后台任务类型无效。")
+            message = (True, result)
+        except ArtworkError as error:
+            message = (False, str(error))
+        except Exception:
+            message = (False, "图片后台任务失败，请重试。")
+        connection.send(message)
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            connection.close()
