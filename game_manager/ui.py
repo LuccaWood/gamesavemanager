@@ -489,26 +489,29 @@ class GameManagerApp(ctk.CTk):
         self.search.bind("<KeyRelease>", lambda _: self.refresh_sidebar())
         self.game_list = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent")
         self.game_list.grid(row=3, column=0, sticky="nsew", padx=8)
-        delete_controls = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        delete_controls.grid(row=4, column=0, padx=16, pady=(10, 0), sticky="ew")
+        sidebar_actions = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        sidebar_actions.grid(row=4, column=0, padx=16, pady=(10, 16), sticky="ew")
+        sidebar_actions.grid_columnconfigure((0, 1), weight=1, uniform="sidebar_actions")
+        self.add_button = ctk.CTkButton(sidebar_actions, text="＋ 添加游戏", height=34, width=100, command=self.add_game)
+        self.add_button.grid(row=0, column=0, padx=(0, 3), pady=(0, 6), sticky="ew")
+        self.import_button = ctk.CTkButton(sidebar_actions, text="导入游戏包", height=34, width=100,
+                                          fg_color="#303b51", command=self.import_archive)
+        self.import_button.grid(row=0, column=1, padx=(3, 0), pady=(0, 6), sticky="ew")
+        self.library_button = ctk.CTkButton(sidebar_actions, text="资料库迁移", height=34, width=100,
+                                           fg_color="#303b51", command=self.library_transfer)
+        self.library_button.grid(row=1, column=0, padx=(0, 3), pady=(0, 6), sticky="ew")
+        self.settings_button = ctk.CTkButton(sidebar_actions, text="软件设置", height=34, width=100,
+                                            fg_color="transparent", border_width=1, command=self.settings)
+        self.settings_button.grid(row=1, column=1, padx=(3, 0), pady=(0, 6), sticky="ew")
+        delete_controls = ctk.CTkFrame(sidebar_actions, fg_color="transparent")
+        delete_controls.grid(row=2, column=0, columnspan=2, sticky="ew")
         delete_controls.grid_columnconfigure(0, weight=1)
-        self.delete_games_button = ctk.CTkButton(delete_controls, text="删除勾选游戏", height=36, width=140,
+        self.delete_games_button = ctk.CTkButton(delete_controls, text="删除勾选游戏", height=34, width=140,
                                                 fg_color="#703d4a", hover_color="#8e4b5d",
                                                 command=self.delete_checked_games)
         self.delete_games_button.grid(row=0, column=0, sticky="ew")
-        self.cancel_game_selection_button = ctk.CTkButton(delete_controls, text="取消", width=52, height=36,
+        self.cancel_game_selection_button = ctk.CTkButton(delete_controls, text="取消", width=52, height=34,
                                                           fg_color="#303b51", command=self.cancel_game_selection)
-        self.add_button = ctk.CTkButton(self.sidebar, text="＋ 添加游戏", height=42, command=self.add_game)
-        self.add_button.grid(row=5, column=0, padx=16, pady=(16, 8), sticky="ew")
-        self.import_button = ctk.CTkButton(self.sidebar, text="导入游戏数据包", height=38,
-                                          fg_color="#303b51", command=self.import_archive)
-        self.import_button.grid(row=6, column=0, padx=16, pady=(0, 8), sticky="ew")
-        self.library_button = ctk.CTkButton(self.sidebar, text="资料库迁移", height=38,
-                                           fg_color="#303b51", command=self.library_transfer)
-        self.library_button.grid(row=7, column=0, padx=16, pady=(0, 8), sticky="ew")
-        self.settings_button = ctk.CTkButton(self.sidebar, text="软件设置", fg_color="transparent",
-                                            border_width=1, command=self.settings)
-        self.settings_button.grid(row=8, column=0, padx=16, pady=(0, 20), sticky="ew")
         self.content = ctk.CTkFrame(self, fg_color="transparent")
         self.content.grid(row=0, column=1, padx=24, pady=(22, 8), sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
@@ -599,7 +602,7 @@ class GameManagerApp(ctk.CTk):
         self.update_delete_games_button()
 
     def update_delete_games_button(self):
-        text = f"删除勾选的游戏（{len(self.checked_game_ids)}）" if self.game_selection_mode else "删除勾选游戏"
+        text = f"删除勾选（{len(self.checked_game_ids)}）" if self.game_selection_mode else "删除勾选游戏"
         disabled = self.busy or self._closing or not self.storage.games or (self.game_selection_mode and not self.checked_game_ids)
         self.delete_games_button.configure(text=text, state="disabled" if disabled else "normal")
         self.cancel_game_selection_button.configure(state="disabled" if self.busy or self._closing else "normal")
