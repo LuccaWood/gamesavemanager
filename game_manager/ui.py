@@ -747,17 +747,16 @@ class GameManagerApp(ctk.CTk):
         table_frame.grid(row=1, column=0, sticky="nsew", padx=12)
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
-        self.backup_table = ttk.Treeview(table_frame, columns=("sequence", "time", "reason", "size"),
+        self.backup_table = ttk.Treeview(table_frame, columns=("sequence", "time", "size"),
                                          show="headings", selectmode="extended", style="Saves.Treeview")
         for key, text, width in (("sequence", "编号", 65), ("time", "本地备份时间", 210),
-                                 ("reason", "类型", 110), ("size", "压缩大小", 95)):
-            self.backup_table.heading(key, text=text)
-            self.backup_table.column(key, width=width, minwidth=60, stretch=key == "time")
+                                 ("size", "压缩大小", 95)):
+            self.backup_table.heading(key, text=text, anchor="center")
+            self.backup_table.column(key, width=width, minwidth=60, stretch=key == "time", anchor="center")
         self.backup_table.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.backup_table.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.backup_table.configure(yscrollcommand=scrollbar.set)
-        reasons = {"manual": "手动备份", "before_restore": "还原前保护", "copy": "复制备份"}
         try:
             records = self.backups.list_backups(game)
         except (ValueError, OSError) as exc:
@@ -768,8 +767,7 @@ class GameManagerApp(ctk.CTk):
         for backup in records:
             time = backup["created_at"].replace("T", " ")
             self.backup_table.insert("", "end", iid=backup["id"], values=(
-                f"#{backup['sequence']:06d}", time, reasons.get(backup.get("reason"), backup.get("reason", "")),
-                readable_size(backup["size"])))
+                f"#{backup['sequence']:06d}", time, readable_size(backup["size"])))
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.grid(row=2, column=0, padx=12, pady=14, sticky="ew")
         for text, callback in (("还原所选", self.restore_backup), ("复制备份", self.copy_backup),
