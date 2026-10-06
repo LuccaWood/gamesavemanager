@@ -303,6 +303,66 @@ class UITests(unittest.TestCase):
         self.assertEqual(exported.read_bytes(), export_content)
         self.assertIn("全部备份和图片", messagebox.askyesno.call_args.args[1])
 
+    def test_game_checkboxes_are_hidden_until_delete_mode_is_requested(self):
+        from customtkinter import CTkCheckBox
+        second = self.add_archived_game("Second Game")
+        self.app.refresh()
+        self.app.select(second["id"])
+        self.assertEqual(self.app.game_checks, {})
+        self.assertFalse(any(isinstance(widget, CTkCheckBox) for row in self.app.game_list.winfo_children()
+                             for widget in row.winfo_children()))
+        self.assertEqual(self.app.delete_games_button.cget("text"), "删除勾选游戏")
+        self.assertEqual(self.app.delete_games_button.cget("state"), "normal")
+        self.assertEqual(self.app.cancel_game_selection_button.grid_info(), {})
+        with patch("game_manager.ui.messagebox.askyesno") as confirm:
+            self.app.delete_games_button.invoke()
+            confirm.assert_not_called()
+        self.assertTrue(self.app.game_selection_mode)
+        self.assertEqual(set(self.app.game_checks), {self.game["id"], second["id"]})
+        self.assertTrue(all(check.get() == 0 for check in self.app.game_checks.values()))
+        self.assertIn("（0）", self.app.delete_games_button.cget("text"))
+        self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        self.assertEqual(self.app.cancel_game_selection_button.winfo_manager(), "grid")
+        self.assertEqual(self.app.selected_id, second["id"])
+
+    def test_cancel_game_selection_clears_checks_without_deleting_games(self):
+        self.app.backups.create(self.game)
+        second = self.add_archived_game("Second Game")
+        self.app.refresh()
+        self.app.delete_games_button.invoke()
+        for game in (self.game, second):
+            self.app.game_checks[game["id"]].toggle()
+        self.app.search.insert(0, "Second")
+        self.app.select(second["id"])
+        with patch("game_manager.ui.messagebox.askyesno") as confirm:
+            self.app.cancel_game_selection_button.invoke()
+            confirm.assert_not_called()
+        self.assertFalse(self.app.game_selection_mode)
+        self.assertEqual(self.app.game_checks, {})
+        self.assertEqual(self.app.checked_game_ids, set())
+        self.assertEqual(self.app.cancel_game_selection_button.grid_info(), {})
+        self.assertEqual(self.app.delete_games_button.cget("state"), "normal")
+        self.assertEqual(self.app.selected_id, second["id"])
+        for game in (self.game, second):
+            self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.app.delete_games_button.invoke()
+        self.app.search.delete(0, "end")
+        self.app.refresh_sidebar()
+        self.assertTrue(all(check.get() == 0 for check in self.app.game_checks.values()))
+
+    def test_deleting_current_game_keeps_other_checked_games_in_selection_mode(self):
+        second = self.add_archived_game("Second Game")
+        self.app.refresh()
+        self.app.delete_games_button.invoke()
+        self.app.game_checks[second["id"]].toggle()
+        self.app.delete_game()
+        self.wait_for_task()
+        self.assertEqual(self.app.storage.games, [second])
+        self.assertTrue(self.app.game_selection_mode)
+        self.assertEqual(self.app.checked_game_ids, {second["id"]})
+        self.assertEqual(self.app.game_checks[second["id"]].get(), 1)
+        self.assertEqual(self.app.delete_games_button.cget("state"), "normal")
+
     def test_multiple_checked_games_delete_their_archives(self):
         from game_manager.ui import messagebox
         self.app.backups.create(self.game)
@@ -313,6 +373,7 @@ class UITests(unittest.TestCase):
         for game in (second, third):
             self.app.backups.create(game)
         self.app.refresh()
+        self.app.delete_games_button.invoke()
         self.app.game_checks[self.game["id"]].toggle()
         self.app.game_checks[second["id"]].toggle()
         self.assertEqual(self.app.checked_game_ids, {self.game["id"], second["id"]})
@@ -328,7 +389,10 @@ class UITests(unittest.TestCase):
         self.assertTrue(exported.is_file())
         self.assertEqual(self.app.selected_id, third["id"])
         self.assertEqual(self.app.checked_game_ids, set())
-        self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        self.assertFalse(self.app.game_selection_mode)
+        self.assertEqual(self.app.game_checks, {})
+        self.assertEqual(self.app.delete_games_button.cget("state"), "normal")
+        self.assertEqual(self.app.cancel_game_selection_button.grid_info(), {})
         messagebox.askyesno.assert_called_once()
         prompt = messagebox.askyesno.call_args.args[1]
         self.assertIn("Test Game", prompt)
@@ -337,6 +401,7 @@ class UITests(unittest.TestCase):
 
     def test_selected_game_is_empty_while_its_batch_deletion_is_pending(self):
         second = self.app.storage.save_game({"english_name": "Second Game", "save_path": str(self.save_dir)})
+        self.app.delete_games_button.invoke()
         self.app.checked_game_ids = {self.game["id"], second["id"]}
         entered, release = threading.Event(), threading.Event()
         delete = self.app.delete_game_data
@@ -364,6 +429,7 @@ class UITests(unittest.TestCase):
         second = self.add_archived_game("Second Game")
         third = self.add_archived_game("Third Game")
         self.app.refresh()
+        self.app.delete_games_button.invoke()
         for game in (self.game, second):
             self.app.game_checks[game["id"]].toggle()
         self.app.search.insert(0, "Third")
@@ -378,6 +444,7 @@ class UITests(unittest.TestCase):
         for game in (self.game, second, third):
             self.assertEqual(len(self.app.backups.list_backups(game)), 1)
         self.assertEqual(self.app.checked_game_ids, {self.game["id"], second["id"]})
+        self.assertTrue(self.app.game_selection_mode)
         prompt = confirm.call_args.args[1]
         self.assertIn("Test Game", prompt)
         self.assertIn("Second Game", prompt)
@@ -399,6 +466,7 @@ class UITests(unittest.TestCase):
         (outside / "keep.dat").write_bytes(b"keep")
         link = self.app.storage.game_dir(second)
         link.symlink_to(outside, target_is_directory=True)
+        self.app.delete_games_button.invoke()
         self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
         self.app.refresh()
         try:
@@ -410,6 +478,7 @@ class UITests(unittest.TestCase):
             self.assertEqual((outside / "keep.dat").read_bytes(), b"keep")
             self.assertIn("已删除 0 / 共 3", messagebox.showerror.call_args.args[1])
             self.assertIn("Second Game", messagebox.showerror.call_args.args[1])
+            self.assertTrue(self.app.game_selection_mode)
         finally:
             link.unlink()
 
@@ -425,6 +494,7 @@ class UITests(unittest.TestCase):
                 raise OSError("second configuration failed")
             return save(games, settings)
 
+        self.app.delete_games_button.invoke()
         self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
         self.app.refresh()
         with patch.object(self.app.storage, "_save", side_effect=fail_second):
@@ -435,6 +505,7 @@ class UITests(unittest.TestCase):
         for game in (second, third):
             self.assertEqual(len(self.app.backups.list_backups(game)), 1)
         self.assertEqual(self.app.checked_game_ids, {second["id"], third["id"]})
+        self.assertTrue(self.app.game_selection_mode)
         self.assertEqual(self.app.selected_id, second["id"])
         self.assertIn("已删除 1 / 共 3", messagebox.showerror.call_args.args[1])
         self.assertIn("Second Game", messagebox.showerror.call_args.args[1])
@@ -457,6 +528,7 @@ class UITests(unittest.TestCase):
                 raise PermissionError("second image locked")
             return remove(path, *args, **kwargs)
 
+        self.app.delete_games_button.invoke()
         self.app.checked_game_ids = {game["id"] for game in self.app.storage.games}
         self.app.refresh()
         with patch("game_manager.ui.shutil.rmtree", side_effect=fail_second):
@@ -469,6 +541,7 @@ class UITests(unittest.TestCase):
         for game in (second, third):
             self.assertEqual(len(self.app.backups.list_backups(game)), 1)
         self.assertEqual(self.app.checked_game_ids, {second["id"], third["id"]})
+        self.assertTrue(self.app.game_selection_mode)
         self.assertEqual(self.app.selected_id, second["id"])
         error = messagebox.showerror.call_args.args[1]
         self.assertIn("已删除 1 / 共 3", error)
@@ -483,6 +556,7 @@ class UITests(unittest.TestCase):
         self.wait_until(lambda: (job["temporary"] / "started").exists())
         (job["temporary"] / "release").touch()
         job["process"].join(timeout=3)
+        self.app.delete_games_button.invoke()
         self.app.checked_game_ids = {self.game["id"], second["id"]}
         self.app.delete_checked_games()
         self.assertTrue(job["cancelled"])
@@ -505,6 +579,11 @@ class UITests(unittest.TestCase):
         self.app.start_artwork_job("download", second, {"api_key": "test-key", "proxy_url": ""}, 42)
         job = self.app.artwork_job
         self.wait_until(lambda: (job["temporary"] / "started").exists())
+        self.app.delete_games_button.invoke()
+        self.app.cancel_game_selection_button.invoke()
+        self.assertIs(self.app.artwork_job, job)
+        self.assertFalse(job["cancelled"])
+        self.app.delete_games_button.invoke()
         self.app.checked_game_ids = {self.game["id"], third["id"]}
         self.app.delete_checked_games()
         self.wait_for_task()
@@ -518,7 +597,7 @@ class UITests(unittest.TestCase):
 
     def test_batch_game_controls_empty_busy_and_minimum_window_layout(self):
         with patch("game_manager.ui.messagebox.askyesno") as confirm:
-            self.app.delete_checked_games()
+            self.app.delete_games_button.invoke()
             confirm.assert_not_called()
         self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
         for index in range(12):
@@ -533,6 +612,10 @@ class UITests(unittest.TestCase):
         button = self.app.delete_games_button
         self.assertTrue(button.winfo_ismapped())
         self.assertLessEqual(button.winfo_rooty() + button.winfo_height(), self.app.sidebar.winfo_rooty() + self.app.sidebar.winfo_height())
+        cancel = self.app.cancel_game_selection_button
+        self.assertTrue(cancel.winfo_ismapped())
+        self.assertGreaterEqual(cancel.winfo_rootx(), button.winfo_rootx() + button.winfo_width())
+        self.assertLessEqual(cancel.winfo_rootx() + cancel.winfo_width(), self.app.sidebar.winfo_rootx() + self.app.sidebar.winfo_width())
         self.app.game_list._parent_canvas.yview_moveto(1)
         self.app.update()
         last = self.app.game_checks[self.app.storage.games[-1]["id"]]
@@ -543,6 +626,9 @@ class UITests(unittest.TestCase):
         self.app.refresh()
         self.app.run_task("等待任务", lambda: time.sleep(0.15), lambda _: None)
         self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        self.assertEqual(cancel.cget("state"), "disabled")
+        cancel.invoke()
+        self.assertTrue(self.app.game_selection_mode)
         self.assertTrue(all(check.cget("state") == "disabled" for check in self.app.game_checks.values()))
         self.app.game_checks[self.game["id"]].toggle()
         self.assertEqual(len(self.app.checked_game_ids), 13)
@@ -555,7 +641,9 @@ class UITests(unittest.TestCase):
         self.assertEqual(self.app.storage.games, [])
         self.assertEqual(self.app.checked_game_ids, set())
         self.assertEqual(self.app.game_checks, {})
+        self.assertFalse(self.app.game_selection_mode)
         self.assertEqual(self.app.delete_games_button.cget("state"), "disabled")
+        self.assertEqual(cancel.grid_info(), {})
 
     def test_cancelled_game_deletion_keeps_record_and_all_archives(self):
         self.app.backups.create(self.game)

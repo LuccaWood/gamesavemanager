@@ -452,6 +452,7 @@ class GameManagerApp(ctk.CTk):
         self.backups = BackupManager(self.storage)
         self.api_key = os.environ.get("STEAMGRIDDB_API_KEY", "") or self.storage.settings.get("api_key", "")
         self.selected_id = self.storage.games[0]["id"] if self.storage.games else None
+        self.game_selection_mode = False
         self.checked_game_ids = set()
         self.busy = False
         self.artwork_job = None
@@ -483,10 +484,15 @@ class GameManagerApp(ctk.CTk):
         self.search.bind("<KeyRelease>", lambda _: self.refresh_sidebar())
         self.game_list = ctk.CTkScrollableFrame(self.sidebar, fg_color="transparent")
         self.game_list.grid(row=3, column=0, sticky="nsew", padx=8)
-        self.delete_games_button = ctk.CTkButton(self.sidebar, text="删除勾选的游戏（0）", height=36,
+        delete_controls = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        delete_controls.grid(row=4, column=0, padx=16, pady=(10, 0), sticky="ew")
+        delete_controls.grid_columnconfigure(0, weight=1)
+        self.delete_games_button = ctk.CTkButton(delete_controls, text="删除勾选游戏", height=36, width=140,
                                                 fg_color="#703d4a", hover_color="#8e4b5d",
                                                 command=self.delete_checked_games)
-        self.delete_games_button.grid(row=4, column=0, padx=16, pady=(10, 0), sticky="ew")
+        self.delete_games_button.grid(row=0, column=0, sticky="ew")
+        self.cancel_game_selection_button = ctk.CTkButton(delete_controls, text="取消", width=52, height=36,
+                                                          fg_color="#303b51", command=self.cancel_game_selection)
         self.add_button = ctk.CTkButton(self.sidebar, text="＋ 添加游戏", height=42, command=self.add_game)
         self.add_button.grid(row=5, column=0, padx=16, pady=(16, 8), sticky="ew")
         self.import_button = ctk.CTkButton(self.sidebar, text="导入游戏数据包", height=38,
@@ -549,6 +555,8 @@ class GameManagerApp(ctk.CTk):
         self.game_buttons = []
         self.game_checks = {}
         self.checked_game_ids.intersection_update(game["id"] for game in self.storage.games)
+        if not self.storage.games:
+            self.game_selection_mode = False
         query = self.search.get().strip().casefold()
         for game in self.storage.games:
             if query and query not in f"{game['english_name']} {game.get('chinese_name', '')}".casefold():
@@ -558,24 +566,26 @@ class GameManagerApp(ctk.CTk):
                 text += f"\n{game['english_name']}"
             row = ctk.CTkFrame(self.game_list, fg_color="transparent")
             row.pack(fill="x", pady=4)
-            row.grid_columnconfigure(1, weight=1)
-            check = ctk.CTkCheckBox(row, text="", width=22, checkbox_width=18, checkbox_height=18,
-                                   command=lambda gid=game["id"]: self.toggle_game_check(gid))
-            check.grid(row=0, column=0, padx=(0, 6))
-            if game["id"] in self.checked_game_ids:
-                check.select()
-            check.configure(state="disabled" if self.busy or self._closing else "normal")
-            self.game_checks[game["id"]] = check
+            column = 1 if self.game_selection_mode else 0
+            row.grid_columnconfigure(column, weight=1)
+            if self.game_selection_mode:
+                check = ctk.CTkCheckBox(row, text="", width=22, checkbox_width=18, checkbox_height=18,
+                                       command=lambda gid=game["id"]: self.toggle_game_check(gid))
+                check.grid(row=0, column=0, padx=(0, 6))
+                if game["id"] in self.checked_game_ids:
+                    check.select()
+                check.configure(state="disabled" if self.busy or self._closing else "normal")
+                self.game_checks[game["id"]] = check
             button = ctk.CTkButton(row, text=text, anchor="w", height=60,
                                    fg_color=ACCENT if game["id"] == self.selected_id else "transparent",
                                    hover_color="#2c3750", state="disabled" if self.busy else "normal",
                                    command=lambda gid=game["id"]: self.select(gid))
-            button.grid(row=0, column=1, sticky="ew")
+            button.grid(row=0, column=column, sticky="ew")
             self.game_buttons.append(button)
         self.update_delete_games_button()
 
     def toggle_game_check(self, game_id):
-        if self.busy or self._closing:
+        if self.busy or self._closing or not self.game_selection_mode:
             return
         if self.game_checks[game_id].get():
             self.checked_game_ids.add(game_id)
@@ -584,8 +594,21 @@ class GameManagerApp(ctk.CTk):
         self.update_delete_games_button()
 
     def update_delete_games_button(self):
-        self.delete_games_button.configure(text=f"删除勾选的游戏（{len(self.checked_game_ids)}）",
-                                           state="disabled" if self.busy or self._closing or not self.checked_game_ids else "normal")
+        text = f"删除勾选的游戏（{len(self.checked_game_ids)}）" if self.game_selection_mode else "删除勾选游戏"
+        disabled = self.busy or self._closing or not self.storage.games or (self.game_selection_mode and not self.checked_game_ids)
+        self.delete_games_button.configure(text=text, state="disabled" if disabled else "normal")
+        self.cancel_game_selection_button.configure(state="disabled" if self.busy or self._closing else "normal")
+        if self.game_selection_mode:
+            self.cancel_game_selection_button.grid(row=0, column=1, padx=(6, 0))
+        else:
+            self.cancel_game_selection_button.grid_remove()
+
+    def cancel_game_selection(self):
+        if self.busy or self._closing:
+            return
+        self.game_selection_mode = False
+        self.checked_game_ids.clear()
+        self.refresh_sidebar()
 
     def select(self, game_id):
         if self.busy:
@@ -855,7 +878,12 @@ class GameManagerApp(ctk.CTk):
             self.delete_games([game])
 
     def delete_checked_games(self):
-        if self.busy or self._closing:
+        if self.busy or self._closing or not self.storage.games:
+            return
+        if not self.game_selection_mode:
+            self.game_selection_mode = True
+            self.checked_game_ids.clear()
+            self.refresh_sidebar()
             return
         games = [dict(game) for game in self.storage.games if game["id"] in self.checked_game_ids]
         self.delete_games(games)
@@ -898,6 +926,9 @@ class GameManagerApp(ctk.CTk):
         def complete(result):
             if self.selected_id not in {item["id"] for item in self.storage.games}:
                 self.selected_id = self.storage.games[0]["id"] if self.storage.games else None
+            self.checked_game_ids.intersection_update(item["id"] for item in self.storage.games)
+            if not result["warning"] and not self.checked_game_ids:
+                self.game_selection_mode = False
             self.refresh()
             if result["warning"]:
                 self.show_error(RuntimeError(f"已删除 {len(result['deleted'])} / 共 {len(games)} 款游戏。\n{result['warning']}"))
