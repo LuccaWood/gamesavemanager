@@ -1636,6 +1636,64 @@ class UITests(unittest.TestCase):
         self.assertEqual((self.app.storage.data_dir / "library.json").read_bytes(), library)
         self.assertEqual(self.app.storage.get_game(self.game["id"])["steamgrid_id"], 42)
 
+    def test_clear_artwork_removes_all_saved_images_and_keeps_backups_and_source(self):
+        from PIL import Image
+        from game_manager.artwork import replace_local_asset
+        folder, _ = self.seed_artwork()
+        source = self.root / "用户原图.png"
+        Image.new("RGB", (80, 80), "green").save(source)
+        replace_local_asset("logo", source, folder)
+        backup = self.app.backups.create(self.game)
+        second = self.add_archived_game("Other Images")
+        other_image = self.app.storage.artwork_dir(second) / "hero.png"
+        other_image.parent.mkdir(parents=True)
+        Image.new("RGB", (1920, 620), "blue").save(other_image)
+        other_bytes = other_image.read_bytes()
+        self.app.storage.save_game({**self.game, "steamgrid_id": 42})
+        self.app.refresh()
+        self.app.clear_artwork_button.invoke()
+        self.wait_for_task()
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertTrue(source.is_file())
+        self.assertEqual(self.app.storage.get_game(self.game["id"])["steamgrid_id"], 42)
+        self.assertEqual(self.app.backups.list_backups(self.game), [backup])
+        self.assertEqual(other_image.read_bytes(), other_bytes)
+        self.assertEqual(self.app.artwork_manifest(self.game).get("assets", {}), {})
+        self.assertIn("已清空", self.app.status.cget("text"))
+        with zipfile.ZipFile(self.app.backups.export(self.game)) as package:
+            self.assertFalse(any(name.startswith("artwork/") for name in package.namelist()))
+
+    def test_clear_artwork_cancel_or_write_failure_keeps_images(self):
+        folder, original = self.seed_artwork()
+        with patch("game_manager.ui.messagebox.askyesno", return_value=False):
+            self.app.clear_artwork(self.game)
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        with patch("game_manager.ui.clear_assets", side_effect=PermissionError("文件被占用")):
+            self.app.clear_artwork(self.game)
+            self.wait_for_task()
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+        self.assertFalse(self.app.busy)
+
+    def test_clear_artwork_is_disabled_during_fetch_or_open_gallery(self):
+        folder, original = self.seed_artwork()
+        with patch("game_manager.ui.artwork_worker", held_artwork_worker):
+            self.start_held_download()
+            self.assertEqual(self.app.clear_artwork_button.cget("state"), "disabled")
+            with patch("game_manager.ui.messagebox.askyesno") as confirm:
+                self.app.clear_artwork(self.game)
+            confirm.assert_not_called()
+            self.app.stop_artwork()
+            self.wait_for_artwork()
+        self.app.storage.save_game({**self.game, "steamgrid_id": 42})
+        with patch("game_manager.ui.artwork_worker", gallery_artwork_worker):
+            self.app.search_artwork_kind(self.game, "cover")
+            self.wait_for_artwork()
+            with patch("game_manager.ui.messagebox.askyesno") as confirm:
+                self.app.clear_artwork(self.game)
+            confirm.assert_not_called()
+            self.app.dialog.destroy()
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()}, original)
+
     def test_gallery_and_single_image_tasks_can_stop_and_block_manual_changes(self):
         folder, original = self.seed_artwork()
         value = {"game_id": 42, "kind": "cover", "page": 0, "candidate": {"id": 100}}

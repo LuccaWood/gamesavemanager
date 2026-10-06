@@ -767,5 +767,155 @@ class ArtworkSelectionTests(unittest.TestCase):
                     function.assert_called_once_with(42, "wide", value["candidate"], self.destination)
 
 
+class ClearArtworkTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.destination = self.root / "artwork"
+
+    def make_previous(self):
+        self.destination.mkdir()
+        files = {"cover.png": b"downloaded image", "local.jpg": b"copied image", "assets.json": b"broken manifest"}
+        for filename, content in files.items():
+            (self.destination / filename).write_bytes(content)
+        return files
+
+    def test_clear_removes_all_images_and_bad_manifest_without_touching_other_files(self):
+        self.make_previous()
+        source = self.root / "original.png"
+        source.write_bytes(b"user image")
+        other_game = self.root / "other-game"
+        other_game.mkdir()
+        (other_game / "cover.png").write_bytes(b"other image")
+        nested = self.destination / "old"
+        nested.mkdir()
+        (nested / "leftover.bin").write_bytes(b"leftover")
+        with patch("game_manager.artwork._read_manifest", side_effect=AssertionError("不应读取损坏记录")):
+            artwork.clear_assets(self.destination)
+        self.assertTrue(self.destination.is_dir())
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(source.read_bytes(), b"user image")
+        self.assertEqual((other_game / "cover.png").read_bytes(), b"other image")
+        self.assertEqual(set(self.root.iterdir()), {self.destination, source, other_game})
+
+    def test_missing_and_empty_directory_are_idempotent(self):
+        artwork.clear_assets(self.destination)
+        self.assertFalse(self.destination.exists())
+        self.destination.mkdir()
+        artwork.clear_assets(self.destination)
+        artwork.clear_assets(self.destination)
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(set(self.root.iterdir()), {self.destination})
+
+    def test_target_links_junction_file_root_and_traversal_are_rejected(self):
+        self.make_previous()
+        link = self.root / "link"
+        link.symlink_to(self.destination, target_is_directory=True)
+        linked_child = link / "child"
+        (self.destination / "child").mkdir()
+        file = self.root / "file"
+        file.write_bytes(b"keep")
+        for destination in (link, linked_child, file, Path(self.root.anchor), self.root / ".." / self.root.name / "artwork"):
+            with self.subTest(destination=destination), self.assertRaises(ArtworkError):
+                artwork.clear_assets(destination)
+        with patch.object(Path, "is_junction", side_effect=lambda: True), self.assertRaises(ArtworkError):
+            artwork.clear_assets(self.destination)
+        self.assertEqual((self.destination / "cover.png").read_bytes(), b"downloaded image")
+        self.assertEqual(file.read_bytes(), b"keep")
+
+    def test_content_links_are_removed_without_following_external_targets(self):
+        self.destination.mkdir()
+        source = self.root / "original.png"
+        source.write_bytes(b"user image")
+        external = self.root / "external"
+        external.mkdir()
+        (external / "keep.png").write_bytes(b"external image")
+        (self.destination / "linked-image.png").symlink_to(source)
+        (self.destination / "linked-directory").symlink_to(external, target_is_directory=True)
+        artwork.clear_assets(self.destination)
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual(source.read_bytes(), b"user image")
+        self.assertEqual((external / "keep.png").read_bytes(), b"external image")
+
+    def test_rename_failure_leaves_previous_images_and_removes_staging(self):
+        before = self.make_previous()
+        with patch.object(Path, "rename", side_effect=PermissionError("permission denied")), self.assertRaises(ArtworkError):
+            artwork.clear_assets(self.destination)
+        self.assertEqual({path.name: path.read_bytes() for path in self.destination.iterdir()}, before)
+        self.assertEqual(set(self.root.iterdir()), {self.destination})
+
+    def test_empty_directory_publish_failure_rolls_back_previous_images(self):
+        before = self.make_previous()
+        original_rename = Path.rename
+
+        def fail_publish(path, target):
+            if path.name.startswith(".artwork-empty-"):
+                raise PermissionError("permission denied")
+            return original_rename(path, target)
+
+        with patch.object(Path, "rename", fail_publish), self.assertRaises(ArtworkError):
+            artwork.clear_assets(self.destination)
+        self.assertEqual({path.name: path.read_bytes() for path in self.destination.iterdir()}, before)
+        self.assertEqual(set(self.root.iterdir()), {self.destination})
+
+    def test_publish_and_rollback_failure_reports_preserved_previous_path(self):
+        before = self.make_previous()
+        original_rename = Path.rename
+
+        def fail_publish_and_rollback(path, target):
+            if path.name.startswith(".artwork-"):
+                raise PermissionError("permission denied")
+            return original_rename(path, target)
+
+        with patch.object(Path, "rename", fail_publish_and_rollback), self.assertRaisesRegex(ArtworkError, "回滚未完成") as raised:
+            artwork.clear_assets(self.destination)
+        previous = list(self.root.glob(".artwork-previous-*"))
+        self.assertEqual(len(previous), 1)
+        self.assertIn(str(previous[0]), str(raised.exception))
+        self.assertEqual({path.name: path.read_bytes() for path in previous[0].iterdir()}, before)
+        self.assertEqual(set(self.root.iterdir()), {previous[0]})
+
+    def test_cleanup_failure_reports_remaining_path_instead_of_success(self):
+        self.make_previous()
+        original_rmtree = artwork.shutil.rmtree
+
+        def fail_previous_cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith(".artwork-previous-"):
+                (Path(path) / "cover.png").unlink()
+                raise PermissionError("permission denied")
+            return original_rmtree(path, *args, **kwargs)
+
+        with patch("game_manager.artwork.shutil.rmtree", fail_previous_cleanup), self.assertRaisesRegex(
+                ArtworkError, "清理失败") as raised:
+            artwork.clear_assets(self.destination)
+        previous = list(self.root.glob(".artwork-previous-*"))
+        self.assertEqual(len(previous), 1)
+        self.assertIn(str(previous[0]), str(raised.exception))
+        self.assertTrue((previous[0] / "local.jpg").is_file())
+        self.assertTrue(self.destination.is_dir())
+        self.assertEqual(list(self.destination.iterdir()), [])
+
+    def test_rollback_and_staging_cleanup_failure_reports_both_remaining_paths(self):
+        before = self.make_previous()
+        original_rename = Path.rename
+
+        def fail_publish_and_rollback(path, target):
+            if path.name.startswith(".artwork-"):
+                raise PermissionError("permission denied")
+            return original_rename(path, target)
+
+        with patch.object(Path, "rename", fail_publish_and_rollback), \
+                patch("game_manager.artwork.shutil.rmtree", side_effect=PermissionError("permission denied")), \
+                self.assertRaisesRegex(ArtworkError, "清理失败") as raised:
+            artwork.clear_assets(self.destination)
+        previous, staging = list(self.root.glob(".artwork-previous-*")), list(self.root.glob(".artwork-empty-*"))
+        self.assertEqual(len(previous), 1)
+        self.assertEqual(len(staging), 1)
+        self.assertIn(str(previous[0]), str(raised.exception))
+        self.assertIn(str(staging[0]), str(raised.exception))
+        self.assertEqual({path.name: path.read_bytes() for path in previous[0].iterdir()}, before)
+
+
 if __name__ == "__main__":
     unittest.main()

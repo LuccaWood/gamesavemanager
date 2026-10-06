@@ -22,7 +22,7 @@ import webbrowser
 import customtkinter as ctk
 from PIL import Image, ImageOps
 
-from .artwork import ArtworkError, artwork_worker, merge_assets, replace_local_asset
+from .artwork import ArtworkError, artwork_worker, clear_assets, merge_assets, replace_local_asset
 from .backups import BackupManager
 from .network import NetworkError, settings_proxy_url, validate_proxy_url
 from .pcgamingwiki import pcgw_worker
@@ -793,6 +793,11 @@ class GameManagerApp(ctk.CTk):
         self.artwork_button.pack(side="left")
         if self.artwork_job is not None:
             self.artwork_button.configure(state="disabled")
+        self.clear_artwork_button = self.button(bar, "清空图片", lambda: self.clear_artwork(game),
+                                                width=104, fg_color="#703d4a", hover_color="#8e4b5d")
+        self.clear_artwork_button.pack(side="left", padx=(8, 0))
+        if self.artwork_job is not None:
+            self.clear_artwork_button.configure(state="disabled")
         self.button(bar, "打开图片目录", lambda: self.open_game_data(game, "artwork"),
                     width=125, fg_color="#303b51").pack(side="left", padx=10)
         self.button(bar, "查看网站 ↗", lambda: webbrowser.open(
@@ -1177,6 +1182,23 @@ class GameManagerApp(ctk.CTk):
         if on_resolved is not None:
             on_resolved(saved)
 
+    def clear_artwork(self, game):
+        if (self.busy or self.artwork_job is not None or self._closing
+                or (self.dialog is not None and self.dialog.winfo_exists())):
+            return
+        if not messagebox.askyesno("清空图片", "清空当前游戏的全部图片和来源记录？\n游戏备份及用户原始图片文件不受影响。", parent=self):
+            return
+        if self.busy or self.artwork_job is not None or self._closing:
+            return
+        current = self.current_artwork_game(game)
+        if current is None:
+            return
+        def work():
+            self.backups._root(current)
+            clear_assets(self.storage.artwork_dir(current))
+        self.run_task("正在清空游戏图片…", work,
+                      lambda _: self.operation_done(f"{current['english_name']} 的图片已清空。"))
+
     def change_artwork(self, game, kind):
         if self.busy or self.artwork_job is not None or self._closing:
             return
@@ -1539,6 +1561,8 @@ class GameManagerApp(ctk.CTk):
         self.update_delete_games_button()
         if self.artwork_job is not None and hasattr(self, "artwork_button") and self.artwork_button.winfo_exists():
             self.artwork_button.configure(state="disabled")
+        if self.artwork_job is not None and hasattr(self, "clear_artwork_button") and self.clear_artwork_button.winfo_exists():
+            self.clear_artwork_button.configure(state="disabled")
         if self.artwork_job is not None:
             for button in self.artwork_controls:
                 button.configure(state="disabled")

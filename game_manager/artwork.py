@@ -160,6 +160,43 @@ def replace_local_asset(kind: str, source: Path, destination: Path) -> dict:
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def clear_assets(destination: Path) -> None:
+    """清空图片目录，不依赖可能损坏的来源记录。"""
+    destination = _ordinary_directory(destination)
+    if ".." in destination.parts or any(parent.is_symlink() or parent.is_junction() for parent in destination.parents):
+        raise ArtworkError("图片存储位置不能包含链接或上级目录跳转。")
+    if not destination.exists():
+        return
+    staging = None
+    previous = destination.with_name(f".{destination.name}-previous-{uuid.uuid4().hex}")
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}-empty-", dir=destination.parent))
+        destination.rename(previous)
+        try:
+            staging.rename(destination)
+        except OSError:
+            try:
+                previous.rename(destination)
+            except OSError:
+                raise ArtworkError(f"图片清空失败且回滚未完成，原图片保留在 {previous}，请手动恢复。") from None
+            raise
+        try:
+            shutil.rmtree(previous)
+        except OSError:
+            raise ArtworkError(f"图片目录已清空，但旧图片清理失败，剩余内容位于 {previous}，请手动删除。") from None
+    except OSError:
+        raise ArtworkError("无法清空图片目录，请检查目录权限后重试。") from None
+    finally:
+        if staging is not None and staging.exists():
+            try:
+                shutil.rmtree(staging)
+            except OSError:
+                message = f"清空操作的暂存目录清理失败，剩余目录位于 {staging}，请手动删除。"
+                if previous.exists():
+                    message += f"原图片仍保留在 {previous}，请手动恢复。"
+                raise ArtworkError(message) from None
+
+
 class SteamGridDB:
     BASE_URL = "https://www.steamgriddb.com/api/v2"
     TIMEOUT = (5, 30)
