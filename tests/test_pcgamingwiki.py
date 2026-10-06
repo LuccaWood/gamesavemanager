@@ -6,7 +6,7 @@ from unittest import mock
 
 import requests
 
-from game_manager.pcgamingwiki import PCGamingWiki, PCGamingWikiError, pcgw_worker
+from game_manager.pcgamingwiki import PCGamingWiki, PCGamingWikiError, _lookup_steam_cloud, pcgw_worker
 
 
 HTML = r'''
@@ -147,9 +147,12 @@ class PCGamingWikiTests(unittest.TestCase):
         connection = mock.Mock()
         client = mock.Mock()
         client.search_games.return_value = []
-        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client):
+        empty = {"locations": [], "source": "Steam 云存档"}
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client), \
+                mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud", return_value=empty) as fallback:
             pcgw_worker(connection, "", "Hades")
-        connection.send.assert_called_once_with((True, []))
+        connection.send.assert_called_once_with((True, empty))
+        fallback.assert_called_once_with("", "Hades")
         client.find_save_locations.assert_not_called()
         connection.reset_mock()
         candidate = {"pageid": 12, "title": "Hades II"}
@@ -165,6 +168,132 @@ class PCGamingWikiTests(unittest.TestCase):
         client.search_games.assert_not_called()
         client.find_save_locations.assert_called_once_with("Hades II", page_id=12)
         connection.send.assert_called_once_with((True, client.find_save_locations.return_value))
+
+    def test_worker_access_failure_uses_steam_fallback_with_same_proxy(self):
+        for error in (PCGamingWikiError("PCGamingWiki 拒绝访问（HTTP 403）。"),
+                      PCGamingWikiError("PCGamingWiki 查询超时。")):
+            connection, client = mock.Mock(), mock.Mock()
+            client.search_games.side_effect = error
+            result = [{"path": r"%LOCALAPPDATA%\Game", "resolved": True, "source": "Steam 云存档"}]
+            with self.subTest(error=error), mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client), \
+                    mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud", return_value=result) as fallback:
+                pcgw_worker(connection, "socks5h://127.0.0.1:7890", "Game")
+            fallback.assert_called_once_with("socks5h://127.0.0.1:7890", "Game")
+            connection.send.assert_called_once_with((True, result))
+            client.close.assert_called_once()
+            connection.close.assert_called_once()
+
+    def test_worker_missing_windows_paths_uses_selected_article_title_for_fallback(self):
+        connection, client = mock.Mock(), mock.Mock()
+        client.find_save_locations.return_value = []
+        article = {"title": "Selected Game", "pageid": 42}
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client), \
+                mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud", return_value=[]) as fallback:
+            pcgw_worker(connection, "", article)
+        fallback.assert_called_once_with("", "Selected Game")
+        client.find_save_locations.assert_called_once_with("Selected Game", page_id=42)
+
+    def test_worker_successful_wiki_result_does_not_query_steam(self):
+        connection, client = mock.Mock(), mock.Mock()
+        client.search_games.return_value = [{"title": "Game", "pageid": 42}]
+        client.find_save_locations.return_value = [{"path": r"%APPDATA%\Game", "resolved": True}]
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client), \
+                mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud") as fallback:
+            pcgw_worker(connection, "", "Game")
+        fallback.assert_not_called()
+        connection.send.assert_called_once_with((True, client.find_save_locations.return_value))
+
+    def test_http_403_falls_back_through_real_clients_and_returns_steam_rules(self):
+        wiki_session, steam_session, connection = mock.Mock(), mock.Mock(), mock.Mock()
+        wiki_session.get.return_value = mock.Mock(status_code=403)
+        search, info = mock.Mock(status_code=200), mock.Mock(status_code=200)
+        search.json.return_value = {"items": [{"id": 1145360, "name": "Hades"}]}
+        info.json.return_value = {"status": "success", "data": {"1145360": {
+            "common": {"name": "Hades", "gameid": "1145360", "type": "Game"},
+            "ufs": {"savefiles": {"0": {"root": "WinAppDataLocal", "path": "Hades/Saves", "pattern": "*.sav"}}}}}}
+        steam_session.get.side_effect = [search, info]
+        with mock.patch("game_manager.pcgamingwiki.create_session", return_value=wiki_session) as wiki_factory, \
+                mock.patch("game_manager.steam_cloud.create_session", return_value=steam_session) as steam_factory, \
+                mock.patch("game_manager.steam_cloud.sys.platform", "darwin"):
+            pcgw_worker(connection, "http://localhost:7890", "Hades")
+        wiki_factory.assert_called_once_with("http://localhost:7890")
+        steam_factory.assert_called_once_with("http://localhost:7890")
+        ok, result = connection.send.call_args.args[0]
+        self.assertTrue(ok)
+        self.assertEqual(result[0]["source"], "Steam 云存档")
+        self.assertEqual(result[0]["path"], r"%LOCALAPPDATA%\Hades\Saves")
+        self.assertTrue(result[0]["resolved"])
+        self.assertEqual(wiki_session.get.call_count, 1)
+        self.assertEqual(steam_session.get.call_count, 2)
+        search.close.assert_called_once()
+        info.close.assert_called_once()
+        wiki_session.close.assert_called_once()
+        steam_session.close.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_worker_steam_selection_bypasses_wiki_and_preserves_id(self):
+        connection = mock.Mock()
+        candidate = {"name": "Game", "id": 1145360, "source": "Steam 云存档"}
+        result = [{"path": r"%APPDATA%\Game", "source": "Steam 云存档", "resolved": True}]
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki") as wiki, \
+                mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud", return_value=result) as fallback:
+            pcgw_worker(connection, "http://localhost:7890", candidate)
+        wiki.assert_not_called()
+        fallback.assert_called_once_with("http://localhost:7890", candidate)
+        connection.send.assert_called_once_with((True, result))
+        connection.close.assert_called_once()
+
+    def test_worker_reports_both_failed_sources_without_retrying(self):
+        from game_manager.network import NetworkError
+        connection, client = mock.Mock(), mock.Mock()
+        client.search_games.side_effect = PCGamingWikiError("PCGamingWiki 拒绝访问（HTTP 403）。")
+        with mock.patch("game_manager.pcgamingwiki.PCGamingWiki", return_value=client), \
+                mock.patch("game_manager.pcgamingwiki._lookup_steam_cloud", side_effect=NetworkError("Steam 备用查询超时。")) as fallback:
+            pcgw_worker(connection, "", "Game")
+        ok, message = connection.send.call_args.args[0]
+        self.assertFalse(ok)
+        self.assertIn("403", message)
+        self.assertIn("Steam 备用查询超时", message)
+        fallback.assert_called_once()
+        client.close.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_steam_fallback_waits_for_game_choice_and_queries_only_selected_id(self):
+        client = mock.Mock()
+        client.search_games.return_value = [{"id": 11, "name": "Game", "source": "Steam 云存档"},
+                                           {"id": 12, "name": "Game II", "source": "Steam 云存档"}]
+        with mock.patch("game_manager.steam_cloud.SteamCloud", return_value=client) as factory:
+            result = _lookup_steam_cloud("socks5h://localhost:7890", "Game")
+        factory.assert_called_once_with("socks5h://localhost:7890")
+        self.assertEqual(result, {"games": client.search_games.return_value, "source": "Steam 云存档"})
+        client.find_save_locations.assert_not_called()
+        client.close.assert_called_once()
+        client.reset_mock()
+        client.find_save_locations.return_value = [{"path": r"%APPDATA%\GameII", "source": "Steam 云存档"}]
+        with mock.patch("game_manager.steam_cloud.SteamCloud", return_value=client):
+            result = _lookup_steam_cloud("", {"id": 12, "name": "Game II", "source": "Steam 云存档"})
+        client.search_games.assert_not_called()
+        client.find_save_locations.assert_called_once_with("Game II", 12)
+        self.assertEqual(result, client.find_save_locations.return_value)
+        client.close.assert_called_once()
+
+    def test_steam_fallback_unique_empty_and_error_close_client(self):
+        client = mock.Mock()
+        client.search_games.return_value = [{"id": 11, "name": "Game", "source": "Steam 云存档"}]
+        client.find_save_locations.return_value = []
+        with mock.patch("game_manager.steam_cloud.SteamCloud", return_value=client):
+            self.assertEqual(_lookup_steam_cloud("", "Game"), {"locations": [], "source": "Steam 云存档"})
+        client.find_save_locations.assert_called_once_with("Game", 11)
+        client.reset_mock()
+        client.search_games.return_value = []
+        with mock.patch("game_manager.steam_cloud.SteamCloud", return_value=client):
+            self.assertEqual(_lookup_steam_cloud("", "Game"), {"locations": [], "source": "Steam 云存档"})
+        client.find_save_locations.assert_not_called()
+        client.reset_mock()
+        client.search_games.side_effect = PCGamingWikiError("模拟网络错误")
+        with mock.patch("game_manager.steam_cloud.SteamCloud", return_value=client), self.assertRaises(PCGamingWikiError):
+            _lookup_steam_cloud("", "Game")
+        client.close.assert_called_once()
 
     def test_worker_invalid_selected_candidate_never_falls_back_to_title_search(self):
         for candidate in ({"title": "Game"}, {"title": "Game", "pageid": "42"}, {"title": "", "pageid": 42}):

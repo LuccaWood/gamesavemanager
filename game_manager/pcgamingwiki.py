@@ -260,24 +260,61 @@ class PCGamingWiki:
         return sorted(candidates, key=lambda item: not item["resolved"])
 
 
+def _lookup_steam_cloud(proxy_url: str, value: str | dict):
+    from .steam_cloud import SteamCloud
+
+    client = SteamCloud(proxy_url)
+    try:
+        if isinstance(value, dict):
+            result = client.find_save_locations(value.get("name"), value.get("id"))
+        else:
+            games = client.search_games(value)
+            if len(games) > 1:
+                return {"games": games, "source": "Steam 云存档"}
+            result = client.find_save_locations(games[0]["name"], games[0]["id"]) if games else []
+        return result if result else {"locations": [], "source": "Steam 云存档"}
+    finally:
+        client.close()
+
+
 def pcgw_worker(connection, proxy_url: str, value: str | dict) -> None:
     client = None
     try:
-        client = PCGamingWiki(proxy_url)
-        if isinstance(value, dict):
-            title, page_id = value.get("title"), value.get("pageid")
-            if not isinstance(title, str) or not title.strip() or type(page_id) is not int or page_id <= 0:
-                raise PCGamingWikiError("请选择有效的 PCGamingWiki 文章。")
-            result = client.find_save_locations(title, page_id=page_id)
+        if isinstance(value, dict) and value.get("source") == "Steam 云存档":
+            result = _lookup_steam_cloud(proxy_url, value)
         else:
-            candidates = client.search_games(value)
-            if len(candidates) > 1:
-                result = {"games": candidates}
-            elif candidates:
-                candidate = candidates[0]
-                result = client.find_save_locations(candidate["title"], page_id=candidate["pageid"])
+            if isinstance(value, dict):
+                title, page_id = value.get("title"), value.get("pageid")
+                if not isinstance(title, str) or not title.strip() or type(page_id) is not int or page_id <= 0:
+                    raise PCGamingWikiError("请选择有效的 PCGamingWiki 文章。")
+            elif not isinstance(value, str) or not value.strip():
+                raise PCGamingWikiError("请先填写游戏英文名。")
             else:
+                title, page_id = value.strip(), None
+            client = PCGamingWiki(proxy_url)
+            wiki_error = ""
+            try:
+                if page_id is not None:
+                    result = client.find_save_locations(title, page_id=page_id)
+                else:
+                    candidates = client.search_games(title)
+                    if len(candidates) > 1:
+                        result = {"games": candidates}
+                    elif candidates:
+                        candidate = candidates[0]
+                        title = candidate["title"]
+                        result = client.find_save_locations(title, page_id=candidate["pageid"])
+                    else:
+                        result = []
+            except PCGamingWikiError as error:
+                wiki_error = str(error)
                 result = []
+            if isinstance(result, list) and not result:
+                try:
+                    result = _lookup_steam_cloud(proxy_url, title)
+                except NetworkError as error:
+                    message = wiki_error or "PCGamingWiki 未提供 Windows 存档目录。"
+                    raise NetworkError(f"{message}\nSteam 备用查询也失败：{error}") from None
         connection.send((True, result))
     except NetworkError as error:
         connection.send((False, str(error)))

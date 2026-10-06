@@ -91,7 +91,7 @@ class GameDialog(ctk.CTkToplevel):
                 button.grid(row=row, column=2, padx=(0, 24), pady=10)
                 self.browse_buttons.append(button)
         ctk.CTkLabel(self, text="英文名必填；纯数字按 Steam App ID 查询名称后保存。\n"
-                     "存档目录留空时自动查询 PCGamingWiki，支持系统环境变量。",
+                     "存档目录留空时优先查询 PCGamingWiki，不可用时查询 Steam 云存档。",
                      text_color=MUTED, justify="left").grid(row=5, column=0, columnspan=3, padx=24, pady=8, sticky="w")
         self.error = ctk.CTkLabel(self, text="", text_color="#ff9d9d", wraplength=600)
         self.error.grid(row=6, column=0, columnspan=3, padx=24, sticky="w")
@@ -248,7 +248,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self.proxy_url.pack(fill="x", padx=24)
         self.toggle_proxy()
         ctk.CTkLabel(self, text="支持 HTTP、HTTPS 和 SOCKS；socket:// 是 SOCKS5 兼容写法。\n"
-                     "用于 Steam、SteamGridDB 和 PCGamingWiki；去除勾选后本机直连。", text_color=MUTED,
+                     "用于 Steam、SteamGridDB、PCGamingWiki 和 SteamCMD；去除勾选后本机直连。", text_color=MUTED,
                      justify="left").pack(
             anchor="w", padx=24, pady=(6, 0))
         ctk.CTkButton(self, text="打开 API Key 申请页面 ↗", fg_color="transparent", border_width=1,
@@ -315,7 +315,8 @@ class LibraryTransferDialog(ctk.CTkToplevel):
 class GameChoiceDialog(ctk.CTkToplevel):
     def __init__(self, app: GameManagerApp, candidates: list[dict], callback, source="SteamGridDB"):
         super().__init__(app)
-        self.title("选择 PCGamingWiki 匹配文章" if source == "PCGamingWiki" else "选择 SteamGridDB 游戏")
+        self.title("选择 PCGamingWiki 匹配文章" if source == "PCGamingWiki" else
+                   "选择 Steam 云存档游戏" if source == "Steam 云存档" else "选择 SteamGridDB 游戏")
         self.geometry("560x470")
         self.transient(app)
         ctk.CTkLabel(self, text="请选择准确的游戏文章" if source == "PCGamingWiki" else "请选择对应游戏",
@@ -344,8 +345,11 @@ class SaveLocationDialog(ctk.CTkToplevel):
         self.transient(app)
         ctk.CTkLabel(self, text=game["english_name"], font=ctk.CTkFont(size=21, weight="bold")).pack(
             anchor="w", padx=20, pady=(18, 8))
-        ctk.CTkLabel(self, text="请选择对应版本。含占位符、注册表或不明确的位置需手动填写。",
-                     text_color=MUTED).pack(anchor="w", padx=20, pady=(0, 12))
+        steam_cloud = candidates[0].get("source") == "Steam 云存档"
+        hint = ("以下目录由 Steam 云同步规则推导，仅适用于 Steam 版本，请确认后使用。\n"
+                "含账号占位符或不明确的位置需手动填写。" if steam_cloud else
+                "请选择对应版本。含占位符、注册表或不明确的位置需手动填写。")
+        ctk.CTkLabel(self, text=hint, text_color=MUTED, justify="left").pack(anchor="w", padx=20, pady=(0, 12))
         frame = ctk.CTkScrollableFrame(self)
         frame.pack(fill="both", expand=True, padx=20, pady=(0, 12))
         for candidate in candidates:
@@ -354,7 +358,8 @@ class SaveLocationDialog(ctk.CTkToplevel):
             ctk.CTkButton(frame, text="使用此目录" if candidate["resolved"] else "需手动填写",
                           state="normal" if candidate["resolved"] else "disabled",
                           command=lambda item=candidate: self.choose(item, callback)).pack(anchor="w", pady=(0, 8))
-        ctk.CTkButton(self, text="打开 PCGamingWiki 页面 ↗", fg_color="transparent", border_width=1,
+        ctk.CTkButton(self, text="打开 SteamDB 页面 ↗" if steam_cloud else "打开 PCGamingWiki 页面 ↗",
+                      fg_color="transparent", border_width=1,
                       command=lambda: webbrowser.open(candidates[0]["page_url"])).pack(side="left", padx=20, pady=16)
         ctk.CTkButton(self, text="手动编辑目录", command=lambda: self.edit(app, game)).pack(
             side="right", padx=20, pady=16)
@@ -1118,16 +1123,25 @@ class GameManagerApp(ctk.CTk):
         current = self.current_lookup_game(game)
         if current is None:
             return
+        source = candidates.get("source", "PCGamingWiki") if isinstance(candidates, dict) else "PCGamingWiki"
         if isinstance(candidates, dict) and "games" in candidates:
-            self.set_status(f"请为 {game['english_name']} 选择准确的 PCGamingWiki 游戏文章。")
+            self.set_status(f"请为 {game['english_name']} 选择准确的 {source} 游戏。")
             self.open_dialog(GameChoiceDialog, candidates["games"],
                              lambda candidate: self.choose_save_game(game, network, candidate, on_resolved),
-                             "PCGamingWiki")
-        elif not candidates:
-            self.set_status(f"PCGamingWiki 未提供 {game['english_name']} 的 Windows 存档目录，请手动填写或点击查询目录重试。")
-        elif len(candidates) == 1 and candidates[0]["resolved"]:
+                             source)
+            return
+        if isinstance(candidates, dict):
+            candidates = candidates.get("locations", [])
+        if candidates:
+            source = candidates[0].get("source", "PCGamingWiki")
+        if not candidates:
+            sources = "PCGamingWiki 和 Steam 云存档" if source == "Steam 云存档" else source
+            self.set_status(f"{sources} 未提供 {game['english_name']} 的 Windows 存档目录，请手动填写或点击查询目录重试。")
+        elif len(candidates) == 1 and candidates[0]["resolved"] and source != "Steam 云存档":
             self.use_save_location(current, candidates[0], on_resolved)
         else:
+            if source == "Steam 云存档":
+                self.set_status(f"已从 Steam 云存档取得 {game['english_name']} 的目录规则，请确认目录后使用。")
             self.open_dialog(SaveLocationDialog, current, candidates,
                              lambda candidate: self.use_save_location(game, candidate, on_resolved))
 
@@ -1155,7 +1169,8 @@ class GameManagerApp(ctk.CTk):
             self.show_error(exc)
             return
         self.refresh()
-        self.set_status(f"已从 PCGamingWiki 填入 {saved['english_name']} 的 Windows 存档目录：{saved['save_path']}")
+        source = candidate.get("source", "PCGamingWiki")
+        self.set_status(f"已从 {source} 填入 {saved['english_name']} 的 Windows 存档目录：{saved['save_path']}")
         if on_resolved is not None:
             on_resolved(saved)
 
@@ -1288,7 +1303,7 @@ class GameManagerApp(ctk.CTk):
         self.artwork_job = {"action": action, "game": dict(game), "network": network, "value": value,
                             "temporary": temporary, "process": process, "receiver": receiver,
                             "cancelled": False}
-        self.artwork_job["status"] = (f"正在从 PCGamingWiki 查询 {game['english_name']} 的存档目录…" if action == "save_lookup"
+        self.artwork_job["status"] = (f"正在查询 {game['english_name']} 的存档目录…" if action == "save_lookup"
                                       else f"正在{'搜索' if action == 'search' else '获取'} {game['english_name']} 的图片…")
         if action in ("gallery", "download_one"):
             self.artwork_job["status"] = f"正在{'搜索' if action == 'gallery' else '下载'} {game['english_name']} 的{ARTWORK_TITLES[value['kind']]}…"

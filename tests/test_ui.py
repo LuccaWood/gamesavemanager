@@ -90,6 +90,27 @@ def held_selected_save_game_worker(connection, proxy_url, value):
         held_save_location_worker(connection, proxy_url, value["title"])
 
 
+def choice_steam_cloud_worker(connection, proxy_url, value):
+    if isinstance(value, str):
+        connection.send((True, {"source": "Steam 云存档", "games": [
+            {"id": 101, "name": "Other Steam Game", "source": "Steam 云存档"},
+            {"id": 202, "name": value, "source": "Steam 云存档"}]}))
+    else:
+        path = value["name"].split("|", 1)[1] if "|" in value["name"] else r"%LOCALAPPDATA%\SteamGame"
+        connection.send((True, [{"title": value["name"], "label": "Steam 云同步规则 · *.sav",
+                                 "source": "Steam 云存档", "path": path, "resolved": True,
+                                 "page_url": f"https://steamdb.info/app/{value['id']}/ufs/"}]))
+    connection.close()
+
+
+def held_selected_steam_cloud_worker(connection, proxy_url, value):
+    if isinstance(value, str):
+        choice_steam_cloud_worker(connection, proxy_url, value)
+    else:
+        while True:
+            time.sleep(0.02)
+
+
 def gallery_artwork_worker(connection, api_key, proxy_url, action, value, destination=None):
     from PIL import Image
     sizes = {"cover": (600, 900), "wide": (920, 430), "hero": (1920, 620), "logo": (300, 120)}
@@ -1125,6 +1146,79 @@ class UITests(unittest.TestCase):
             self.wait_for_artwork()
         self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], r"%LOCALAPPDATA%\SelectedGame")
         self.assertEqual(self.app.storage.get_game(game["id"])["english_name"], "Selected Game")
+
+    def test_steam_fallback_choice_confirms_directory_and_preserves_proxy_and_backup(self):
+        from customtkinter import CTkButton
+        from game_manager.ui import GameChoiceDialog, SaveLocationDialog
+        with patch("game_manager.ui.pcgw_worker", choice_steam_cloud_worker):
+            self.app.storage.update_settings({"proxy_enabled": True, "proxy_url": "socket://127.0.0.1:7890"})
+            game = self.app.storage.save_game({"english_name": "Steam Selected|" + str(self.save_dir)})
+            self.app.select(game["id"])
+            self.app.create_backup()
+            self.app.select(self.game["id"])
+            self.wait_for_artwork()
+            self.assertIsInstance(self.app.dialog, GameChoiceDialog)
+            self.assertEqual(self.app.dialog.title(), "选择 Steam 云存档游戏")
+            self.app.storage.update_settings({"proxy_enabled": False})
+            self.choose_pcgw_article(202)
+            self.assertEqual(self.app.artwork_job["value"]["id"], 202)
+            self.assertEqual(self.app.artwork_job["network"]["proxy_url"], "socks5h://127.0.0.1:7890")
+            self.wait_for_artwork()
+            self.assertIsInstance(self.app.dialog, SaveLocationDialog)
+            self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+            self.assertEqual(self.app.backups.list_backups(game), [])
+            def descendants(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from descendants(child)
+            use_button = next(widget for widget in descendants(self.app.dialog)
+                              if isinstance(widget, CTkButton) and widget.cget("text") == "使用此目录")
+            use_button.invoke()
+            self.wait_for_task()
+        self.assertEqual(len(self.app.backups.list_backups(game)), 1)
+        self.assertEqual(len(self.app.backups.list_backups(self.game)), 0)
+        self.assertEqual(self.app.selected_id, self.game["id"])
+
+    def test_steam_directory_confirmation_can_be_cancelled_and_links_to_steamdb(self):
+        from customtkinter import CTkButton
+        from game_manager.ui import SaveLocationDialog
+        game = self.app.storage.save_game({"english_name": "Steam Confirmation"})
+        candidate = {"path": r"%APPDATA%\SteamGame", "source": "Steam 云存档", "resolved": True,
+                     "label": "Steam 云同步规则 · *.sav", "page_url": "https://steamdb.info/app/202/ufs/"}
+        callbacks = []
+        self.app.save_location_results(game, [candidate], callbacks.append)
+        self.assertIsInstance(self.app.dialog, SaveLocationDialog)
+        buttons = [widget for widget in self.app.dialog.winfo_children() if isinstance(widget, CTkButton)]
+        source_button = next(widget for widget in buttons if widget.cget("text") == "打开 SteamDB 页面 ↗")
+        with patch("game_manager.ui.webbrowser.open") as browser:
+            source_button.invoke()
+        browser.assert_called_once_with(candidate["page_url"])
+        self.app.dialog.destroy()
+        self.app.update()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.assertEqual(callbacks, [])
+
+    def test_selected_steam_cloud_lookup_can_be_stopped(self):
+        with patch("game_manager.ui.pcgw_worker", held_selected_steam_cloud_worker):
+            game = self.app.storage.save_game({"english_name": "Stop Steam Lookup"})
+            self.app.select(game["id"])
+            self.wait_for_artwork()
+            self.choose_pcgw_article(202)
+            process = self.app.artwork_job["process"]
+            self.assertTrue(process.is_alive())
+            self.app.stop_artwork()
+            self.wait_for_artwork()
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
+        self.assertEqual(self.app.save_lookup_queue, [])
+        self.assertIn("已停止", self.app.status.cget("text"))
+
+    def test_both_sources_without_windows_paths_show_manual_edit_hint(self):
+        game = self.app.storage.save_game({"english_name": "No Steam Rules"})
+        self.app.save_location_results(game, {"locations": [], "source": "Steam 云存档"}, None)
+        self.assertIsNone(self.app.dialog)
+        self.assertIn("Steam", self.app.status.cget("text"))
+        self.assertIn("手动填写", self.app.status.cget("text"))
+        self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
 
     def test_switching_cards_preserves_active_artwork_status(self):
         second = self.app.storage.save_game({"english_name": "Another Game", "save_path": str(self.save_dir)})
