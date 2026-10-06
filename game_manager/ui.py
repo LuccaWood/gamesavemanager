@@ -398,9 +398,11 @@ class SaveLocationDialog(ctk.CTkToplevel):
             text.insert("1.0", f"{candidate['label']}\n{candidate['path']}")
             text.configure(state="disabled")
             text.pack(fill="x", pady=(8, 4))
-            ctk.CTkButton(frame, text="使用此目录" if candidate["resolved"] else "需手动填写",
-                          state="normal" if candidate["resolved"] else "disabled",
-                          command=lambda item=candidate: self.choose(item, callback)).pack(anchor="w", pady=(0, 8))
+            if candidate["resolved"]:
+                ctk.CTkButton(frame, text="使用此目录",
+                              command=lambda item=candidate: self.choose(item, callback)).pack(anchor="w", pady=(0, 8))
+            else:
+                ctk.CTkLabel(frame, text="需手动填写", text_color=MUTED).pack(anchor="w", pady=(0, 8))
         ctk.CTkButton(self, text="打开 SteamDB 页面 ↗" if steam_cloud else "打开 PCGamingWiki 页面 ↗",
                       fg_color="transparent", border_width=1,
                       command=lambda: webbrowser.open(candidates[0]["page_url"])).pack(side="left", padx=20, pady=16)

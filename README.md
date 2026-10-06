@@ -107,7 +107,7 @@ PCGamingWiki 返回 HTTP 403、超时、其他查询错误，或没有匹配文�
 
 备用源提供 [Steam Auto-Cloud](https://partner.steamgames.com/doc/features/cloud) 的云同步规则，与 SteamDB 云存档页面使用同类 Steam 配置；规则可能只包含部分存档或配置文件，不保证是游戏的全部存档，也仅适用于对应 Steam 版本。即使只有一个可用目录，仍会显示候选和文件匹配规则，需要点击“使用此目录”后才保存及继续备份或还原；取消不会写入目录或执行后续操作。文件匹配规则只作为提示，备份仍包含所选目录的全部内容。只有云容量信息、没有公开目录规则的游戏，需要手动填写。
 
-存档目录确认窗口中的候选说明和路径可以选中并复制全部或部分内容：Windows 按 Ctrl+C，macOS 按 ⌘C。内容只读，长路径可滚动查看；含占位符、需手动填写的候选也可以复制。复制不会保存目录或执行备份，还需点击“使用此目录”确认。
+存档目录确认窗口中的候选说明和路径可以选中并复制全部或部分内容：Windows 按 Ctrl+C，macOS 按 ⌘C。内容只读，长路径可滚动查看；含占位符、需手动填写的候选也可以复制。可用候选提供“使用此目录”按钮；“需手动填写”以普通文字提示展示。复制不会保存目录或执行备份，还需点击“使用此目录”确认。
 
 Windows 下文档、AppData、LocalLow 和 Saved Games 根目录通过系统 KnownFolder 获取实际位置，兼容目录重定向。macOS 调试时不会猜测 Windows 文档等目录；账号 ID、游戏安装目录、未知根目录和复杂的根覆盖规则会显示为待手动核对的候选，不能直接使用。候选中的“打开 SteamDB 页面”仅打开浏览器供人工查看；程序不会自动抓取 SteamDB 页面，其[官方 FAQ](https://steamdb.info/faq/#can-i-use-auto-refreshing-plugins-or-automatically-scrapecrawl-steamdb)不允许自动抓取。
 

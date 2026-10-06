@@ -1437,7 +1437,7 @@ class UITests(unittest.TestCase):
 
     def test_save_location_contents_allow_partial_copy_without_editing_or_confirming(self):
         from tkinter import TclError
-        from customtkinter import CTkButton, CTkTextbox
+        from customtkinter import CTkButton, CTkLabel, CTkTextbox
         from game_manager.ui import SaveLocationDialog
 
         def descendants(widget):
@@ -1482,7 +1482,10 @@ class UITests(unittest.TestCase):
                     self.assertEqual(self.app.storage.get_game(game["id"])["save_path"], "")
                 buttons = [widget for widget in descendants(dialog) if isinstance(widget, CTkButton)
                            and widget.cget("text") in ("使用此目录", "需手动填写")]
-                self.assertEqual([button.cget("state") for button in buttons], ["normal", "disabled"])
+                self.assertEqual([button.cget("state") for button in buttons], ["normal"])
+                tips = [widget for widget in descendants(dialog) if isinstance(widget, CTkLabel)
+                        and widget.cget("text") == "需手动填写"]
+                self.assertEqual(len(tips), 1)
                 buttons[0].invoke()
                 self.assertEqual(callbacks, [candidates[0]])
         finally:
